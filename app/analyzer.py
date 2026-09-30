@@ -27,7 +27,9 @@ import torch
 from ultralytics import YOLO
 
 from .color_analysis import (
+    METHOD_LABELS,
     FlameColorResult,
+    MethodResult,
     RepresentativeColor,
     analyze_flame_colors,
     representative_to_schema,
@@ -43,13 +45,16 @@ from .errors import (
     NoFlamePixelsError,
     error_payload,
 )
+from .fire_classes import classify
 from .imaging import validate_image
 from .material_matching import MaterialDatabase, load_material_database, match_material
 from .schemas import (
     AnalysisResult,
     AnalysisTiming,
     ClusteringResult,
+    ClusterCentroid,
     FlameAnalysis,
+    FlameColor,
 )
 from .segmentation import segment_fire
 
@@ -64,22 +69,46 @@ def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000.0, _TIMING_DECIMALS)
 
 
+def _centroid_schema(result: MethodResult, centroid) -> ClusterCentroid:
+    """Convert one internal cluster centroid into its schema entry."""
+    return ClusterCentroid(
+        index=centroid.index,
+        size=centroid.size,
+        weight=centroid.weight,
+        rgb=[int(v) for v in centroid.rgb()],
+        lab=[round(float(v), 2) for v in centroid.lab],
+    )
+
+
 def _clustering_schema(
-    color: RepresentativeColor | None,
+    result: MethodResult | None,
     method: str,
     colors: FlameColorResult,
-    cluster_count: int,
 ) -> ClusteringResult | None:
     """Build the schema entry for one clustering method, if it succeeded."""
-    if color is None:
+    if result is None or result.color is None:
         return None
+    dominant = result.dominant
     return ClusteringResult(
-        rgb=color.rgb_list,
-        lab=color.lab_list,
+        rgb=result.color.rgb_list,
+        lab=result.color.lab_list,
         method=method,
-        cluster_count=cluster_count,
+        cluster_count=result.cluster_count,
         samples_used=colors.samples_used,
         pixels_sampled=colors.pixels_sampled,
+        dominant_cluster=result.dominant_index,
+        dominant_color=(
+            FlameColor(
+                rgb=[int(v) for v in dominant.rgb()],
+                lab=[round(float(v), 2) for v in dominant.lab],
+            )
+            if dominant is not None
+            else FlameColor()
+        ),
+        centroids=[_centroid_schema(result, item) for item in result.centroids],
+        noise_count=result.noise_count,
+        representative=result.representative,
+        fallback=result.fallback,
     )
 
 
@@ -232,9 +261,14 @@ class FlameAnalyzer:
             color_ms = _elapsed_ms(stage)
 
             stage = time.perf_counter()
-            representatives = [c for c in (colors.kmeans, colors.gmm, colors.mean) if c is not None]
+            representatives = colors.representative_colors()
             material_analysis, suppression = match_material(
                 representatives, self.database, self.settings
+            )
+            fire_class, extinguishing_agents = classify(
+                self.database,
+                material_analysis.primary_material,
+                material_analysis.similarity,
             )
             material_ms = _elapsed_ms(stage)
 
@@ -245,6 +279,8 @@ class FlameAnalyzer:
                 flame_analysis=self._flame_analysis_schema(colors),
                 material_analysis=material_analysis,
                 suppression_information=suppression,
+                fire_class=fire_class,
+                extinguishing_agents=extinguishing_agents,
                 timing=AnalysisTiming(
                     total_ms=_elapsed_ms(started),
                     detection_ms=detection_ms,
@@ -267,12 +303,26 @@ class FlameAnalyzer:
             raise MissingDatabaseError()
 
     def _flame_analysis_schema(self, colors: FlameColorResult) -> FlameAnalysis:
-        cluster_count = self.settings.n_clusters
         return FlameAnalysis(
-            kmeans=_clustering_schema(colors.kmeans, "kmeans", colors, cluster_count),
-            gmm=_clustering_schema(colors.gmm, "gmm", colors, cluster_count),
+            kmeans=_clustering_schema(colors.get("kmeans"), "kmeans", colors),
+            gmm=_clustering_schema(colors.get("gmm"), "gmm", colors),
+            bayesian_gmm=_clustering_schema(colors.get("bayesian_gmm"), "bayesian_gmm", colors),
+            dbscan=_clustering_schema(colors.get("dbscan"), "dbscan", colors),
+            agglomerative=_clustering_schema(colors.get("agglomerative"), "agglomerative", colors),
             mean_color=representative_to_schema(colors.mean),
             flame_pixel_count=colors.pixel_count,
             samples_used=colors.samples_used,
             pixels_sampled=colors.pixels_sampled,
+            n_clusters=colors.n_clusters,
+            algorithms=[
+                METHOD_LABELS[name] for name in colors.algorithms
+            ],
+            skipped_reason=(
+                None
+                if colors.algorithms
+                else (
+                    f"fewer than {self.settings.min_flame_pixels} flame pixels; "
+                    "only the mean flame colour is reported"
+                )
+            ),
         )

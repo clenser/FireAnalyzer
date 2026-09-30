@@ -179,12 +179,18 @@ def create_app(
     application = FastAPI(
         title=f"{SERVICE_NAME} API",
         version=__version__,
-        summary="Flame detection, colour analysis and material matching.",
+        summary="Fire detection, flame segmentation, fire-class and agent analysis.",
         description=(
             "Headless inference API for the FlameAnalyzer pipeline: YOLO fire "
-            "detection, YOLO flame segmentation, K-Means/GMM flame colour "
-            "analysis in CIELAB and deterministic material matching against "
-            "`flame_dataset.json`.\n\n"
+            "detection, YOLO flame segmentation, flame colour clustering in "
+            "CIELAB (K-Means, GMM, Bayesian GMM, DBSCAN and Agglomerative "
+            "Clustering - MeanShift is not used), deterministic material matching "
+            "against `flame_dataset.json`, and a fire class plus extinguishing "
+            "agents derived from that material through a documented mapping.\n\n"
+            "The response carries the *actual segmented flame mask* as a base64 "
+            "PNG.  The detection bounding box (`fire_detection.bbox`) and the "
+            "segmentation mask (`segmentation.mask`) are separate fields: the box "
+            "is a detection rectangle, the mask is the flame region.\n\n"
             "No UI, no LLM calls, no tunnels. Models are loaded once per worker "
             "process and reused for every request."
         ),
@@ -272,7 +278,7 @@ def create_app(
     @application.post(
         "/analyze",
         tags=["analysis"],
-        summary="Analyse an image for fire, flame colour and likely material",
+        summary="Analyse an image for fire, flame region, fire class and agents",
         responses={
             200: {
                 "description": (
@@ -313,7 +319,12 @@ def create_app(
         Accepts `multipart/form-data` with a single `image` field. The bytes are
         decoded in memory (no temporary files) and the response is exactly the
         structure produced by ``FlameAnalyzer.analyze_image``: no NumPy arrays,
-        no masks, no model objects, no filesystem paths.
+        no model objects, no filesystem paths.
+
+        The response reports the detection bounding box
+        (`fire_detection.bounding_box`, alias `bbox`) and the segmented flame
+        region (`segmentation.mask`, a base64 PNG) independently, so a client
+        can overlay the real flame mask without re-deriving it from the box.
         """
         started = time.perf_counter()
 
@@ -417,12 +428,39 @@ def create_app(
 # ---------------------------------------------------------------------------
 # OpenAPI examples (captured from a real run of `python main.py 5.png`)
 # ---------------------------------------------------------------------------
+#: One clustering entry, trimmed to a single centroid so the docs stay readable.
+#: The live response carries `centroids` for every cluster of every algorithm.
+_CLUSTER_EXAMPLE: dict[str, Any] = {
+    "rgb": [255, 203, 89],
+    "lab": [84.7, 7.62, 62.79],
+    "method": "kmeans",
+    "cluster_count": 4,
+    "samples_used": 2000,
+    "pixels_sampled": True,
+    "dominant_cluster": 0,
+    "dominant_color": {"rgb": [255, 214, 105], "lab": [86.24, 2.1, 71.4]},
+    "centroids": [
+        {
+            "index": 0,
+            "size": 1502,
+            "weight": 0.751,
+            "rgb": [255, 214, 105],
+            "lab": [86.24, 2.1, 71.4],
+        },
+        {"index": 1, "size": 498, "weight": 0.249, "rgb": [255, 165, 0], "lab": [72.1, 23.4, 78.9]},
+    ],
+    "noise_count": 0,
+    "representative": "unweighted mean of the K-Means centroids",
+    "fallback": False,
+}
+
 _SUCCESS_EXAMPLE: dict[str, Any] = {
     "success": True,
     "fire_detection": {
         "detected": True,
         "confidence": 0.7899,
         "bounding_box": {"x1": 208, "y1": 144, "x2": 530, "y2": 452},
+        "bbox": {"x1": 208, "y1": 144, "x2": 530, "y2": 452},
     },
     "segmentation": {
         "available": True,
@@ -430,32 +468,40 @@ _SUCCESS_EXAMPLE: dict[str, Any] = {
         "flame_pixel_count": 44820,
         "mask_area_ratio": 0.068131,
         "confidence": 0.9578,
+        "mask_width": 966,
+        "mask_height": 681,
+        "mask_encoding": "png_base64",
+        "mask": "<base64 PNG, 966x681, one byte per pixel scaled to 0 or 255>",
+        "bbox_fallback_reason": None,
+        "fallback": False,
     },
     "flame_analysis": {
-        "kmeans": {
-            "rgb": [255, 231, 141],
-            "lab": [92.17, -1.4, 47.2],
-            "method": "kmeans",
-            "cluster_count": 2,
-            "samples_used": 2000,
-            "pixels_sampled": True,
+        "kmeans": _CLUSTER_EXAMPLE,
+        "gmm": {**_CLUSTER_EXAMPLE, "method": "gmm"},
+        "bayesian_gmm": {**_CLUSTER_EXAMPLE, "method": "bayesian_gmm"},
+        "dbscan": {
+            **_CLUSTER_EXAMPLE,
+            "method": "dbscan",
+            "cluster_count": 1,
+            "noise_count": 16,
+            "representative": "unweighted mean of the DBSCAN cluster means (noise excluded)",
         },
-        "gmm": {
-            "rgb": [255, 221, 98],
-            "lab": [89.09, -0.36, 63.31],
-            "method": "gmm",
-            "cluster_count": 2,
-            "samples_used": 2000,
-            "pixels_sampled": True,
+        "agglomerative": {
+            **_CLUSTER_EXAMPLE,
+            "method": "agglomerative",
+            "representative": "unweighted mean of the Ward agglomerative cluster means",
         },
         "mean_color": {"rgb": [255, 221, 98], "lab": [89.09, -0.36, 63.31]},
         "flame_pixel_count": 44820,
         "samples_used": 2000,
         "pixels_sampled": True,
+        "n_clusters": 4,
+        "algorithms": ["K-Means", "GMM", "Bayesian GMM", "DBSCAN", "Agglomerative"],
+        "skipped_reason": None,
     },
     "material_analysis": {
         "primary_material": "Natural Fibers",
-        "similarity": 0.897,
+        "similarity": 0.9268,
         "alternatives": [
             {"material": "Paper Products(Wood material)", "similarity": 0.8885},
             {"material": "Wax Materials", "similarity": 0.8885},
@@ -469,12 +515,40 @@ _SUCCESS_EXAMPLE: dict[str, Any] = {
         "methods": ["Water", "CO2", "Foam"],
         "database_notes": "Yellow flame, cotton burns fast, wool self-extinguishes, ...",
     },
+    "fire_class": {
+        "class": "Class A",
+        "description": "Ordinary combustibles",
+        "confidence": 0.9268,
+        "material": "Natural Fibers",
+        "basis": "material 'Natural Fibers' -> Class A via app/fire_classes.py ...",
+        "mapping_source": "app/fire_classes.py (documented material -> fire class mapping)",
+        "notes": "Derived from the matched material; not predicted by the detection model.",
+    },
+    "extinguishing_agents": [
+        {
+            "name": "Water",
+            "compound": None,
+            "type": "cooling",
+            "source": "flame_dataset.json",
+            "fire_class": "Class A",
+            "compound_basis": "name verbatim from flame_dataset.json; the dataset "
+            "records no chemical identity, so no compound formula is asserted",
+        },
+        {
+            "name": "CO2",
+            "compound": None,
+            "type": "oxygen_displacement",
+            "source": "flame_dataset.json",
+            "fire_class": "Class A",
+            "compound_basis": "name verbatim from flame_dataset.json; ...",
+        },
+    ],
     "timing": {
-        "total_ms": 83.2,
-        "detection_ms": 41.0,
-        "segmentation_ms": 22.0,
-        "color_ms": 19.0,
-        "material_ms": 0.9,
+        "total_ms": 300.4,
+        "detection_ms": 28.0,
+        "segmentation_ms": 41.0,
+        "color_ms": 227.0,
+        "material_ms": 1.4,
     },
     "error": None,
 }

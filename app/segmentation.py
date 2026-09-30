@@ -4,6 +4,16 @@ Behaviour preserved from the original implementation: the highest-confidence
 mask wins, and if the segmentation model is unavailable / fails / returns an
 empty mask, the detected bounding box is rasterised into a mask instead.  The
 fallback is always reported explicitly in the API response.
+
+The mask itself is returned in two forms:
+
+* as a ``uint8`` array, which the colour stage consumes directly, and
+* as a base64 PNG inside :class:`~app.schemas.SegmentationSummary`, so the API
+  can hand the frontend the actual segmented flame region rather than a
+  bounding box.
+
+The mask is produced by the single segmentation inference pass - YOLO is never
+run a second time just to obtain the mask.
 """
 
 from __future__ import annotations
@@ -15,6 +25,7 @@ import cv2
 import numpy as np
 
 from .config import Settings
+from .mask import MASK_ENCODING, encode_mask_base64
 from .schemas import SegmentationSummary
 
 __all__ = ["segment_fire", "bounding_box_mask", "summarize_mask"]
@@ -61,6 +72,44 @@ def summarize_mask(mask: np.ndarray | None) -> tuple[int, float]:
     return count, round(float(ratio), 6)
 
 
+def _summary(
+    mask: np.ndarray | None,
+    *,
+    available: bool,
+    fallback_used: bool,
+    confidence: float | None,
+    settings: Settings,
+    bbox_fallback_reason: str | None = None,
+) -> SegmentationSummary:
+    """Build the JSON-ready summary, attaching the encoded mask when enabled.
+
+    ``flame_pixel_count`` and ``mask_area_ratio`` are always measured from the
+    mask itself, never from the bounding box, so they describe the same pixels
+    the frontend will draw.
+    """
+    count, ratio = summarize_mask(mask)
+    height, width = (int(mask.shape[0]), int(mask.shape[1])) if mask is not None else (0, 0)
+
+    payload: str | None = None
+    encoding: str | None = None
+    if settings.emit_mask and count > 0:
+        payload = encode_mask_base64(mask, settings.mask_png_compression)
+        encoding = MASK_ENCODING if payload is not None else None
+
+    return SegmentationSummary(
+        available=available,
+        fallback_used=fallback_used,
+        flame_pixel_count=count,
+        mask_area_ratio=ratio,
+        confidence=confidence,
+        mask_width=width,
+        mask_height=height,
+        mask_encoding=encoding,
+        mask=payload,
+        bbox_fallback_reason=bbox_fallback_reason,
+    )
+
+
 def _mask_confidences(result, count: int) -> list[float]:
     """Per-mask confidences for a segmentation result.
 
@@ -101,6 +150,7 @@ def segment_fire(
     original_shape = image_bgr.shape[:2]
     best_mask: np.ndarray | None = None
     best_conf = -1.0
+    model_ran = False
 
     if model is not None:
         try:
@@ -112,6 +162,7 @@ def segment_fire(
                 retina_masks=settings.segmentation_retina_masks,
                 verbose=settings.ultralytics_verbose,
             )
+            model_ran = True
             for result in results:
                 masks = getattr(result, "masks", None)
                 if masks is None or len(masks) == 0:
@@ -127,36 +178,42 @@ def segment_fire(
         except Exception:  # noqa: BLE001 - segmentation failure must degrade, not crash
             logger.exception("Segmentation model failed; falling back to bounding-box mask")
             best_mask = None
+            model_ran = False
     else:
         logger.warning("No segmentation model loaded; using bounding-box mask fallback")
 
     if best_mask is not None and np.count_nonzero(best_mask) > 0:
-        count, ratio = summarize_mask(best_mask)
-        return best_mask, SegmentationSummary(
+        return best_mask, _summary(
+            best_mask,
             available=True,
             fallback_used=False,
-            flame_pixel_count=count,
-            mask_area_ratio=ratio,
             confidence=round(best_conf, 4) if best_conf > 0 else None,
+            settings=settings,
         )
 
+    reason = (
+        "no segmentation model is loaded"
+        if not model_ran
+        else "the segmentation model returned no usable mask"
+    )
+
     if not settings.fallback_to_bbox_mask or not boxes:
-        count, ratio = summarize_mask(best_mask)
-        return (
-            best_mask if best_mask is not None else np.zeros(original_shape, dtype=np.uint8),
-            SegmentationSummary(
-                available=False,
-                fallback_used=False,
-                flame_pixel_count=count,
-                mask_area_ratio=ratio,
-            ),
+        empty = best_mask if best_mask is not None else np.zeros(original_shape, dtype=np.uint8)
+        return empty, _summary(
+            empty,
+            available=False,
+            fallback_used=False,
+            confidence=None,
+            settings=settings,
+            bbox_fallback_reason=reason,
         )
 
     mask = bounding_box_mask(original_shape, boxes)
-    count, ratio = summarize_mask(mask)
-    return mask, SegmentationSummary(
+    return mask, _summary(
+        mask,
         available=False,
         fallback_used=True,
-        flame_pixel_count=count,
-        mask_area_ratio=ratio,
+        confidence=None,
+        settings=settings,
+        bbox_fallback_reason=reason,
     )

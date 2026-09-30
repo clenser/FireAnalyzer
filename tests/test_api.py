@@ -37,50 +37,103 @@ from app.errors import (  # noqa: E402
     MissingUploadError,
     NoFireDetectedError,
 )
+from app.fire_classes import MATERIAL_FIRE_CLASS, MAPPING_SOURCE  # noqa: E402
+from app.mask import MASK_ENCODING, encode_mask_base64, mask_from_base64  # noqa: E402
+from app.material_matching import load_material_database  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DET_MODEL = ROOT / "models" / "OBJ_best.pt"
 SEG_MODEL = ROOT / "models" / "SEG_best.pt"
+DATASET = ROOT / "data" / "flame_dataset.json"
+RETAINED_METHOD_KEYS = ("kmeans", "gmm", "bayesian_gmm", "dbscan", "agglomerative")
+
+#: The stub result mirrors a real 96x96 run.  The mask is a real base64 PNG of an
+#: L-shaped region, so the HTTP tests can decode it and check the pixel count -
+#: it is not a placeholder string.  The mask (1200 px) is deliberately a
+#: different shape from the detection box (60x60 = 3600 px).
+_STUB_MASK_W = _STUB_MASK_H = 96
+_STUB_MASK = np.zeros((_STUB_MASK_H, _STUB_MASK_W), dtype=np.uint8)
+_STUB_MASK[20:60, 20:60] = 255
+_STUB_MASK[40:60, 40:60] = 0
+_STUB_MASK_COUNT = int(np.count_nonzero(_STUB_MASK))
+_STUB_MASK_RATIO = round(_STUB_MASK_COUNT / float(_STUB_MASK.size), 6)
+_STUB_MASK_B64 = encode_mask_base64(_STUB_MASK, compression=6)
+
+_CLUSTER = {
+    "rgb": [255, 203, 89],
+    "lab": [84.7, 7.62, 62.79],
+    "method": "kmeans",
+    "cluster_count": 2,
+    "samples_used": 2000,
+    "pixels_sampled": True,
+    "dominant_cluster": 0,
+    "dominant_color": {"rgb": [255, 214, 105], "lab": [86.24, 2.1, 71.4]},
+    "centroids": [
+        {
+            "index": 0,
+            "size": 1502,
+            "weight": 0.751,
+            "rgb": [255, 214, 105],
+            "lab": [86.24, 2.1, 71.4],
+        },
+        {
+            "index": 1,
+            "size": 498,
+            "weight": 0.249,
+            "rgb": [255, 165, 0],
+            "lab": [72.1, 23.4, 78.9],
+        },
+    ],
+    "noise_count": 0,
+    "representative": "unweighted mean of the K-Means centroids",
+    "fallback": False,
+}
+
+
+def _clustering(method: str, **overrides) -> dict:
+    entry = {**_CLUSTER, "method": method}
+    entry.update(overrides)
+    return entry
+
 
 SUCCESS_RESULT = {
     "success": True,
     "fire_detection": {
         "detected": True,
         "confidence": 0.7899,
-        "bounding_box": {"x1": 208, "y1": 144, "x2": 530, "y2": 452},
+        "bounding_box": {"x1": 10, "y1": 10, "x2": 70, "y2": 70},
+        "bbox": {"x1": 10, "y1": 10, "x2": 70, "y2": 70},
     },
     "segmentation": {
         "available": True,
         "fallback_used": False,
-        "flame_pixel_count": 44820,
-        "mask_area_ratio": 0.068131,
+        "flame_pixel_count": _STUB_MASK_COUNT,
+        "mask_area_ratio": _STUB_MASK_RATIO,
         "confidence": 0.9578,
+        "mask_width": _STUB_MASK_W,
+        "mask_height": _STUB_MASK_H,
+        "mask_encoding": "png_base64",
+        "mask": _STUB_MASK_B64,
+        "bbox_fallback_reason": None,
+        "fallback": False,
     },
     "flame_analysis": {
-        "kmeans": {
-            "rgb": [255, 231, 141],
-            "lab": [92.17, -1.4, 47.2],
-            "method": "kmeans",
-            "cluster_count": 2,
-            "samples_used": 2000,
-            "pixels_sampled": True,
-        },
-        "gmm": {
-            "rgb": [255, 221, 98],
-            "lab": [89.09, -0.36, 63.31],
-            "method": "gmm",
-            "cluster_count": 2,
-            "samples_used": 2000,
-            "pixels_sampled": True,
-        },
+        "kmeans": _clustering("kmeans"),
+        "gmm": _clustering("gmm"),
+        "bayesian_gmm": _clustering("bayesian_gmm"),
+        "dbscan": _clustering("dbscan", cluster_count=1, noise_count=16),
+        "agglomerative": _clustering("agglomerative"),
         "mean_color": {"rgb": [255, 221, 98], "lab": [89.09, -0.36, 63.31]},
-        "flame_pixel_count": 44820,
+        "flame_pixel_count": _STUB_MASK_COUNT,
         "samples_used": 2000,
         "pixels_sampled": True,
+        "n_clusters": 2,
+        "algorithms": ["K-Means", "GMM", "Bayesian GMM", "DBSCAN", "Agglomerative"],
+        "skipped_reason": None,
     },
     "material_analysis": {
         "primary_material": "Natural Fibers",
-        "similarity": 0.897,
+        "similarity": 0.9268,
         "alternatives": [{"material": "Wax Materials", "similarity": 0.8885}],
         "database_notes": "Yellow flame, cotton burns fast, ...",
         "score_basis": "mean LAB distance to flame_dataset.json reference colours",
@@ -91,6 +144,41 @@ SUCCESS_RESULT = {
         "methods": ["Water", "CO2", "Foam"],
         "database_notes": "Yellow flame, cotton burns fast, ...",
     },
+    "fire_class": {
+        "class": "Class A",
+        "description": "Ordinary combustibles",
+        "confidence": 0.9268,
+        "material": "Natural Fibers",
+        "basis": "material 'Natural Fibers' -> Class A via app/fire_classes.py",
+        "mapping_source": "app/fire_classes.py (documented material -> fire class mapping)",
+        "notes": "Derived from the matched material; not predicted by the detection model.",
+    },
+    "extinguishing_agents": [
+        {
+            "name": "Water",
+            "compound": None,
+            "type": "cooling",
+            "source": "flame_dataset.json",
+            "fire_class": "Class A",
+            "compound_basis": "name verbatim from flame_dataset.json; no compound asserted",
+        },
+        {
+            "name": "CO2",
+            "compound": None,
+            "type": "oxygen_displacement",
+            "source": "flame_dataset.json",
+            "fire_class": "Class A",
+            "compound_basis": "name verbatim from flame_dataset.json; no compound asserted",
+        },
+        {
+            "name": "Foam",
+            "compound": None,
+            "type": "blanketing",
+            "source": "flame_dataset.json",
+            "fire_class": "Class A",
+            "compound_basis": "name verbatim from flame_dataset.json; no compound asserted",
+        },
+    ],
     "timing": {
         "total_ms": 83.2,
         "detection_ms": 41.0,
@@ -222,6 +310,140 @@ def test_analyze_does_not_leak_paths_or_arrays():
     assert "ndarray" not in text
     assert "models" not in response.headers.get("content-type", "")
     assert ".pt" not in text
+
+
+# ---------------------------------------------------------------------------
+# POST /analyze - the new fields
+# ---------------------------------------------------------------------------
+def _analyzed(client: TestClient) -> dict:
+    response = client.post("/analyze", files={"image": ("fire.png", _png_bytes(), "image/png")})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_response_carries_the_segmentation_mask():
+    with _client(StubAnalyzer()) as client:
+        body = _analyzed(client)
+
+    segmentation = body["segmentation"]
+    assert segmentation["mask_encoding"] == MASK_ENCODING
+    assert isinstance(segmentation["mask"], str) and segmentation["mask"]
+    assert segmentation["mask_width"] == _STUB_MASK_W
+    assert segmentation["mask_height"] == _STUB_MASK_H
+    assert segmentation["available"] is True
+
+
+def test_the_mask_decodes_over_http_and_matches_the_reported_count():
+    """The client can recover the exact pixels the backend measured."""
+    with _client(StubAnalyzer()) as client:
+        body = _analyzed(client)
+
+    segmentation = body["segmentation"]
+    decoded = mask_from_base64(segmentation["mask"])
+
+    assert decoded is not None, "the API shipped an undecodable mask"
+    assert decoded.shape == (segmentation["mask_height"], segmentation["mask_width"])
+    assert int(decoded.sum()) == segmentation["flame_pixel_count"]
+    assert segmentation["mask_area_ratio"] == pytest.approx(
+        int(decoded.sum()) / decoded.size, abs=1e-6
+    )
+    # The mask is an L, not the detection rectangle: the corner is cut out.
+    assert decoded[20:60, 20:60].any() and not decoded[40:60, 40:60].any()
+
+
+def test_bounding_box_and_mask_are_separate_in_the_response():
+    with _client(StubAnalyzer()) as client:
+        body = _analyzed(client)
+
+    box = body["fire_detection"]["bounding_box"]
+    assert body["fire_detection"]["bbox"] == box  # short alias preserved
+    box_area = (box["x2"] - box["x1"]) * (box["y2"] - box["y1"])
+    assert box_area == 3600
+    assert body["segmentation"]["flame_pixel_count"] == 1200
+    assert body["segmentation"]["flame_pixel_count"] != box_area
+
+
+def test_response_carries_all_five_retained_algorithms():
+    with _client(StubAnalyzer()) as client:
+        body = _analyzed(client)
+
+    flame = body["flame_analysis"]
+    for method in RETAINED_METHOD_KEYS:
+        entry = flame[method]
+        assert entry is not None, f"{method} missing from the response"
+        assert entry["method"] == method
+        assert entry["centroids"]
+        assert entry["representative"]
+    assert flame["algorithms"] == [
+        "K-Means",
+        "GMM",
+        "Bayesian GMM",
+        "DBSCAN",
+        "Agglomerative",
+    ]
+    assert "meanshift" not in json.dumps(body).lower()
+
+
+def test_response_carries_the_fire_class():
+    with _client(StubAnalyzer()) as client:
+        body = _analyzed(client)
+
+    fire_class = body["fire_class"]
+    material = body["material_analysis"]["primary_material"]
+    assert fire_class["class"] == MATERIAL_FIRE_CLASS[material]
+    assert fire_class["material"] == material
+    assert fire_class["mapping_source"] == MAPPING_SOURCE
+    assert "not predicted" in fire_class["notes"]
+
+
+def test_response_carries_extinguishing_agents_from_the_dataset():
+    database = load_material_database(DATASET)
+    with _client(StubAnalyzer()) as client:
+        body = _analyzed(client)
+
+    agents = body["extinguishing_agents"]
+    material = body["material_analysis"]["primary_material"]
+    assert [agent["name"] for agent in agents] == list(database.get(material).extinguishers)
+    assert [agent["name"] for agent in agents] == body["suppression_information"]["methods"]
+    for agent in agents:
+        assert agent["compound"] is None
+        assert agent["source"] == "flame_dataset.json"
+        assert agent["fire_class"] == body["fire_class"]["class"]
+
+
+def test_response_has_no_giant_uncompressed_pixel_array():
+    """A 96x96 mask must travel as a small PNG, not a list of numbers."""
+    with _client(StubAnalyzer()) as client:
+        response = client.post(
+            "/analyze", files={"image": ("fire.png", _png_bytes(), "image/png")}
+        )
+
+    body = response.json()
+    # Structurally: no long array of numbers anywhere in the payload.
+    assert not [
+        value
+        for section in body.values()
+        if isinstance(section, dict)
+        for value in section.values()
+        if isinstance(value, list) and len(value) > 32
+    ]
+    assert isinstance(body["segmentation"]["mask"], str)
+    # The mask travels as one short base64 string, not 9216 JSON numbers.
+    raw_mask_as_json = _STUB_MASK.size * 4
+    assert len(body["segmentation"]["mask"]) < raw_mask_as_json
+    assert len(response.content) < raw_mask_as_json
+
+
+def test_mask_can_be_omitted_from_the_response():
+    result = json.loads(json.dumps(SUCCESS_RESULT))
+    result["segmentation"]["mask"] = None
+    result["segmentation"]["mask_encoding"] = None
+    with _client(StubAnalyzer(result=result)) as client:
+        body = _analyzed(client)
+
+    assert body["segmentation"]["mask"] is None
+    # The measurements survive, so a client can still report the flame area.
+    assert body["segmentation"]["flame_pixel_count"] == _STUB_MASK_COUNT
 
 
 def test_analyzer_is_created_once_per_app():
@@ -519,6 +741,8 @@ def test_api_end_to_end_with_real_models():
         "flame_analysis",
         "material_analysis",
         "suppression_information",
+        "fire_class",
+        "extinguishing_agents",
         "timing",
     ):
         assert section in body, section
@@ -529,3 +753,101 @@ def test_api_end_to_end_with_real_models():
     assert body["suppression_information"]["source"] == "flame_dataset.json"
     assert body["timing"]["total_ms"] > 0
     json.dumps(body)
+
+
+def test_api_mask_survives_the_real_http_round_trip():
+    """What a browser receives: a decodable mask matching the reported count."""
+    payload = _sample_image().read_bytes()
+    settings = Settings.from_env()
+    with TestClient(create_app(settings=settings)) as client:
+        response = client.post("/analyze", files={"image": ("sample.png", payload, "image/png")})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    segmentation = body["segmentation"]
+
+    decoded = mask_from_base64(segmentation["mask"])
+    assert decoded is not None
+    assert decoded.shape == (segmentation["mask_height"], segmentation["mask_width"])
+    assert int(decoded.sum()) == segmentation["flame_pixel_count"]
+    assert segmentation["flame_pixel_count"] > 0
+
+    for method in RETAINED_METHOD_KEYS:
+        assert body["flame_analysis"][method] is not None
+
+    material = body["material_analysis"]["primary_material"]
+    assert body["fire_class"]["class"] == MATERIAL_FIRE_CLASS[material]
+    assert body["extinguishing_agents"]
+
+
+# ---------------------------------------------------------------------------
+# CLI / API parity
+# ---------------------------------------------------------------------------
+def test_cli_prints_the_same_payload_the_api_returns(monkeypatch, capsys, tmp_path):
+    """The CLI is a thin wrapper: identical analysis, identical JSON."""
+    from app import cli
+
+    monkeypatch.setattr(cli, "FlameAnalyzer", lambda settings=None, **kwargs: StubAnalyzer())
+    image = tmp_path / "fire.png"
+    image.write_bytes(_png_bytes())
+
+    exit_code = cli.main([str(image)])
+
+    assert exit_code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == SUCCESS_RESULT
+    assert printed["segmentation"]["mask"] == _STUB_MASK_B64
+    assert printed["fire_class"]["class"] == "Class A"
+    assert len(printed["extinguishing_agents"]) == 3
+
+
+def test_cli_no_mask_reaches_the_analyzer(monkeypatch, capsys, tmp_path):
+    """`--no-mask` is a config override; the CLI must thread it through."""
+    from app import cli
+
+    seen: list[Settings] = []
+
+    def factory(settings=None, **kwargs):
+        seen.append(settings)
+        return StubAnalyzer()
+
+    monkeypatch.setattr(cli, "FlameAnalyzer", factory)
+    image = tmp_path / "fire.png"
+    image.write_bytes(_png_bytes())
+
+    assert cli.main([str(image), "--no-mask"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+
+    assert len(seen) == 1
+    assert seen[0].emit_mask is False
+    # The stub ignores settings, so the printed payload is the analyzer's own.
+    assert printed == SUCCESS_RESULT
+
+
+def test_cli_k_selection_and_clusters_reach_the_analyzer(monkeypatch, capsys, tmp_path):
+    from app import cli
+
+    seen: list[Settings] = []
+
+    def factory(settings=None, **kwargs):
+        seen.append(settings)
+        return StubAnalyzer()
+
+    monkeypatch.setattr(cli, "FlameAnalyzer", factory)
+    image = tmp_path / "fire.png"
+    image.write_bytes(_png_bytes())
+
+    assert cli.main([str(image), "--k-selection", "fixed", "--clusters", "3"]) == 0
+    capsys.readouterr()
+
+    assert seen[0].k_selection == "fixed"
+    assert seen[0].n_clusters == 3
+
+
+def test_cli_reports_a_missing_image(monkeypatch, capsys, tmp_path):
+    from app import cli
+
+    assert cli.main([str(tmp_path / "absent.png")]) == 2
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["success"] is False
+    assert printed["error"]["code"] == "INVALID_IMAGE"

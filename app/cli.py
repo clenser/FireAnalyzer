@@ -34,7 +34,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imgsz", type=int, default=None, help="YOLO inference size")
     parser.add_argument("--conf", type=float, default=None, help="detection confidence threshold")
     parser.add_argument("--clusters", type=int, default=None, help="fixed cluster count (k)")
+    parser.add_argument(
+        "--k-selection",
+        choices=("silhouette", "fixed"),
+        default=None,
+        help="how k is chosen: silhouette search (default) or the fixed --clusters value",
+    )
     parser.add_argument("--device", default=None, help="torch device, e.g. '0' or 'cpu'")
+    parser.add_argument(
+        "--no-mask",
+        action="store_true",
+        help=(
+            "omit the base64 PNG flame mask from the printed JSON. The mask is "
+            "produced either way; this only keeps terminal output readable."
+        ),
+    )
     parser.add_argument(
         "--pretty", action="store_true", help="indent the JSON output (default: compact)"
     )
@@ -59,8 +73,12 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         overrides["detection_conf"] = args.conf
     if args.clusters is not None:
         overrides["n_clusters"] = args.clusters
+    if args.k_selection:
+        overrides["k_selection"] = args.k_selection
     if args.device:
         overrides["device"] = args.device
+    if args.no_mask:
+        overrides["emit_mask"] = False
     return settings.with_overrides(**overrides) if overrides else settings
 
 

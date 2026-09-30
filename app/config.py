@@ -86,13 +86,38 @@ class Settings:
         (handles the letterbox padding correctly).  Disable to reproduce the
         older, cheaper "resize the low-res mask" behaviour.
     n_clusters:
-        Fixed cluster count for K-Means / GMM.  Kept small on purpose: the
-        backend optimises for latency, not for clustering experiments.
+        Cluster count used when ``k_selection`` is ``"fixed"``.  Also the
+        fallback when silhouette selection finds no usable score, and the
+        lower bound for every algorithm.
+    k_selection:
+        ``"silhouette"`` (default, restored from the original pipeline) searches
+        ``k`` in ``[n_clusters, k_max]`` with a silhouette score and caps the
+        winner at ``k_cap``.  ``"fixed"`` always uses ``n_clusters``.
+    k_max, k_cap:
+        Upper search bound and hard cap for silhouette selection, mirroring the
+        original implementation's ``max_k=6`` / ``min(best_k, 4)``.
+    silhouette_sample_size:
+        Number of samples used for the silhouette score (``sample_size`` in
+        scikit-learn).  Bounds the cost of the k search on large masks.
     max_flame_pixels:
         Flame pixels are subsampled to at most this many rows before
         clustering, keeping latency bounded for large masks.
     min_flame_pixels:
         Below this count the mean colour is used instead of clustering.
+    bayesian_gmm_max_iter:
+        Iteration cap for the variational Bayesian GMM.
+    dbscan_eps:
+        DBSCAN neighbourhood radius **in standardised (StandardScaler) units**,
+        not CIELAB units.  This is the original value.
+    dbscan_min_samples, dbscan_min_samples_divisor:
+        ``min_samples = max(dbscan_min_samples, n // dbscan_min_samples_divisor)``,
+        the original adaptive rule.
+    emit_mask:
+        Encode the segmentation mask into the response as a base64 PNG.  Turn
+        off to keep the payload small when only the statistics are needed.
+    mask_png_compression:
+        zlib level passed to the PNG encoder (0-9).  A binary mask compresses
+        extremely well, so this has little effect on the encoded size.
     max_alternatives:
         Number of secondary materials returned next to the primary match.
     similarity_distance_scale:
@@ -128,11 +153,27 @@ class Settings:
 
     # --- colour analysis -----------------------------------------------
     n_clusters: int = 2
+    k_selection: str = "silhouette"
+    k_max: int = 6
+    k_cap: int = 4
+    silhouette_sample_size: int = 300
     max_flame_pixels: int = 2000
     min_flame_pixels: int = 10
     kmeans_n_init: int = 10
     gmm_max_iter: int = 100
+    bayesian_gmm_max_iter: int = 50
+    #: Variance floor for BayesianGMM. sklearn's default (1e-6) raises on
+    #: ill-defined covariances, which happens on tightly separated flame tones;
+    #: a small floor keeps the fit usable there. Raise it for noisier data.
+    bayesian_gmm_reg_covar: float = 1e-3
+    dbscan_eps: float = 0.5
+    dbscan_min_samples: int = 3
+    dbscan_min_samples_divisor: int = 50
     random_seed: int = 42
+
+    # --- segmentation output -------------------------------------------
+    emit_mask: bool = True
+    mask_png_compression: int = 6
 
     # --- material matching ---------------------------------------------
     max_alternatives: int = 3
@@ -166,11 +207,22 @@ class Settings:
             segmentation_retina_masks=_env_bool("FLAME_SEG_RETINA", True),
             fallback_to_bbox_mask=_env_bool("FLAME_BBOX_FALLBACK", True),
             n_clusters=_env_int("FLAME_N_CLUSTERS", 2),
+            k_selection=os.environ.get("FLAME_K_SELECTION", "silhouette").strip().lower() or "silhouette",
+            k_max=_env_int("FLAME_K_MAX", 6),
+            k_cap=_env_int("FLAME_K_CAP", 4),
+            silhouette_sample_size=_env_int("FLAME_SILHOUETTE_SAMPLES", 300),
             max_flame_pixels=_env_int("FLAME_MAX_PIXELS", 2000),
             min_flame_pixels=_env_int("FLAME_MIN_PIXELS", 10),
             kmeans_n_init=_env_int("FLAME_KMEANS_NINIT", 10),
             gmm_max_iter=_env_int("FLAME_GMM_MAX_ITER", 100),
+            bayesian_gmm_max_iter=_env_int("FLAME_BGGMM_MAX_ITER", 50),
+            bayesian_gmm_reg_covar=_env_float("FLAME_BGGMM_REG_COVAR", 1e-3),
+            dbscan_eps=_env_float("FLAME_DBSCAN_EPS", 0.5),
+            dbscan_min_samples=_env_int("FLAME_DBSCAN_MIN_SAMPLES", 3),
+            dbscan_min_samples_divisor=_env_int("FLAME_DBSCAN_MIN_SAMPLES_DIV", 50),
             random_seed=_env_int("FLAME_SEED", 42),
+            emit_mask=_env_bool("FLAME_EMIT_MASK", True),
+            mask_png_compression=_env_int("FLAME_MASK_PNG_COMPRESSION", 6),
             max_alternatives=_env_int("FLAME_MAX_ALTERNATIVES", 3),
             similarity_distance_scale=_env_float("FLAME_SIM_SCALE", 200.0),
             device=os.environ.get("FLAME_DEVICE") or None,

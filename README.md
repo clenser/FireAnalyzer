@@ -1,7 +1,8 @@
 # FlameAnalyzer - inference backend
 
-Headless, cloud-ready flame analysis: **detection -> segmentation -> flame
-colour (CIELAB) -> material matching -> JSON**.
+Headless, cloud-ready flame analysis:
+**detection -> segmentation -> flame colour (CIELAB, five clustering
+algorithms) -> material matching -> fire class -> JSON**.
 
 There is no GUI, no browser UI, no tunnel and no LLM call anywhere in the
 request path. The ML pipeline is transport-agnostic; a thin FastAPI layer
@@ -26,11 +27,13 @@ flame-analyzer/
 │   ├── analyzer.py           # FlameAnalyzer: model loading + pipeline orchestration
 │   ├── api.py                # FastAPI app: POST /analyze, GET /health, GET /
 │   ├── cli.py                # command line runner (prints JSON)
-│   ├── color_analysis.py     # flame pixels -> LAB -> K-Means / GMM representative colour
+│   ├── color_analysis.py     # flame pixels -> LAB -> 5 clustering algorithms
 │   ├── config.py             # Settings: all inference parameters in one place
 │   ├── detection.py          # OBJ_best.pt fire detection
 │   ├── errors.py             # AnalysisError hierarchy + error codes
+│   ├── fire_classes.py       # material -> fire class + extinguishing agents
 │   ├── imaging.py            # image validation / bytes -> BGR decoding
+│   ├── mask.py               # mask -> base64 PNG codec (MASK_ENCODING)
 │   ├── material_matching.py  # LAB matching against flame_dataset.json
 │   ├── schemas.py            # response dataclasses + JSON-safe conversion
 │   ├── segmentation.py       # SEG_best.pt flame segmentation + bbox fallback
@@ -41,7 +44,7 @@ flame-analyzer/
 ├── data/
 │   └── flame_dataset.json    # material database (reference flame colours + suppression data)
 ├── tests/
-│   ├── test_pipeline.py      # pipeline tests (stub models; runs without the weights)
+│   ├── test_pipeline.py      # pipeline tests + real-weight integration test
 │   └── test_api.py           # FastAPI TestClient tests (stubbed analyzer)
 ├── main.py                   # CLI entry point
 ├── test_pipeline.py          # same CLI, kept as the standalone smoke-test script
@@ -67,7 +70,8 @@ python main.py fire_1.jpg
 python test_pipeline.py fire_1.jpg --pretty --verbose
 ```
 
-Run the test suite (50 tests: pipeline + API):
+Run the test suite (105 tests: pipeline, API, CLI, plus a real-weight
+integration test that is skipped when the `.pt` files are absent):
 
 ```bash
 pip install pytest httpx
@@ -167,34 +171,80 @@ Every error body uses one shape:
 
 ## Response shape
 
+The example below is a real result for `5.png` (966x681), with long
+repetitive fields abbreviated as `"..."`. Re-running
+`python main.py 5.png --pretty` reproduces it.
+
 ```json
 {
   "success": true,
   "fire_detection": {
     "detected": true,
-    "confidence": 0.5149,
-    "bounding_box": {"x1": 321, "y1": 99, "x2": 349, "y2": 145}
+    "confidence": 0.7899,
+    "bounding_box": {"x1": 208, "y1": 144, "x2": 530, "y2": 452},
+    "bbox": {"x1": 208, "y1": 144, "x2": 530, "y2": 452}
   },
   "segmentation": {
-    "available": false,
-    "fallback_used": true,
-    "flame_pixel_count": 1288,
-    "mask_area_ratio": 0.006941,
-    "confidence": null
+    "available": true,
+    "fallback_used": false,
+    "fallback": false,
+    "flame_pixel_count": 44820,
+    "mask_area_ratio": 0.068131,
+    "confidence": 0.9578,
+    "mask_width": 966,
+    "mask_height": 681,
+    "mask_encoding": "png_base64",
+    "mask": "iVBORw0KGgoAAAANSUhEUg...",
+    "bbox_fallback_reason": null
   },
   "flame_analysis": {
-    "kmeans": {"rgb": [224, 193, 190], "lab": [80.62, 10.34, 5.85], "cluster_count": 2,
-               "samples_used": 1288, "pixels_sampled": false},
-    "gmm": {"rgb": [237, 217, 214], "lab": [88.24, 6.28, 4.2], "cluster_count": 2,
-            "samples_used": 1288, "pixels_sampled": false},
-    "mean_color": {"rgb": [237, 217, 214], "lab": [88.24, 6.28, 4.2]},
-    "flame_pixel_count": 1288,
-    "samples_used": 1288,
-    "pixels_sampled": false
+    "kmeans": {
+      "rgb": [255, 203, 89], "lab": [80.0, 12.0, 44.0],
+      "method": "kmeans", "cluster_count": 4,
+      "samples_used": 2000, "pixels_sampled": true,
+      "dominant_cluster": 1,
+      "dominant_color": {"rgb": [254, 241, 42], "lab": [93.0, -6.0, 65.0]},
+      "centroids": [
+        {"index": 0, "size": 318, "weight": 0.159,
+         "rgb": [255, 149, 60], "lab": [72.0, 20.0, 50.0]},
+        {"index": 1, "size": 903, "weight": 0.4515,
+         "rgb": [254, 241, 42], "lab": [93.0, -6.0, 65.0]}
+      ],
+      "noise_count": 0,
+      "representative": "unweighted mean of the K-Means centroids",
+      "fallback": false
+    },
+    "gmm": {
+      "rgb": [255, 221, 98], "method": "gmm", "cluster_count": 4,
+      "dominant_cluster": 3, "noise_count": 0,
+      "representative": "mixture-weight weighted mean of the GMM component means"
+    },
+    "bayesian_gmm": {
+      "rgb": [255, 221, 98], "method": "bayesian_gmm", "cluster_count": 4,
+      "dominant_cluster": 3, "noise_count": 0,
+      "representative": "mixture-weight weighted mean of the variational Bayesian GMM component means"
+    },
+    "dbscan": {
+      "rgb": [255, 222, 99], "method": "dbscan", "cluster_count": 1,
+      "dominant_cluster": 0, "noise_count": 16,
+      "representative": "unweighted mean of the DBSCAN cluster means (noise excluded)"
+    },
+    "agglomerative": {
+      "rgb": [255, 196, 89], "method": "agglomerative", "cluster_count": 4,
+      "dominant_cluster": 1, "noise_count": 0,
+      "representative": "unweighted mean of the Ward agglomerative cluster means"
+    },
+    "mean_color": {"rgb": [255, 221, 98], "lab": [89.09, -0.36, 63.31]},
+    "flame_pixel_count": 44820,
+    "samples_used": 2000,
+    "pixels_sampled": true,
+    "n_clusters": 4,
+    "algorithms": ["K-Means", "GMM", "Bayesian GMM", "DBSCAN", "Agglomerative"],
+    "skipped_reason": null
   },
   "material_analysis": {
-    "primary_material": "Alcohol-Based Products",
-    "similarity": 0.8846,
+    "primary_material": "Natural Fibers",
+    "similarity": 0.9268,
     "alternatives": [
       {"material": "Spray Products", "similarity": 0.8469},
       {"material": "Electrical Components", "similarity": 0.7224}
@@ -204,18 +254,80 @@ Every error body uses one shape:
   },
   "suppression_information": {
     "source": "flame_dataset.json",
-    "material": "Alcohol-Based Products",
-    "methods": ["CO2", "Water spray", "Foam"],
+    "material": "Natural Fibers",
+    "methods": ["Water", "CO2", "Foam"],
     "database_notes": "..."
   },
-  "timing": {"total_ms": 83.2, "detection_ms": 41.0, "segmentation_ms": 22.0,
-             "color_ms": 19.0, "material_ms": 0.9},
+  "fire_class": {
+    "class": "Class A",
+    "description": "Ordinary combustibles",
+    "confidence": 0.9268,
+    "material": "Natural Fibers",
+    "basis": "material 'Natural Fibers' -> Class A via app/fire_classes.py (documented material -> fire class mapping)",
+    "mapping_source": "app/fire_classes.py (documented material -> fire class mapping)",
+    "notes": "Derived from the matched material via the documented material -> fire class mapping in app/fire_classes.py, which is itself derived from the extinguishers recorded in flame_dataset.json. The fire class is not predicted by the detection model, and the confidence is the material match's distance-based similarity, not a calibrated probability."
+  },
+  "extinguishing_agents": [
+    {"name": "Water", "compound": null, "type": "cooling",
+     "source": "flame_dataset.json", "fire_class": "Class A",
+     "compound_basis": "name verbatim from flame_dataset.json; the dataset records no chemical identity, so no compound formula is asserted"},
+    {"name": "CO2", "compound": null, "type": "oxygen_displacement",
+     "source": "flame_dataset.json", "fire_class": "Class A",
+     "compound_basis": "name verbatim from flame_dataset.json; the dataset records no chemical identity, so no compound formula is asserted"},
+    {"name": "Foam", "compound": null, "type": "blanketing",
+     "source": "flame_dataset.json", "fire_class": "Class A",
+     "compound_basis": "name verbatim from flame_dataset.json; the dataset records no chemical identity, so no compound formula is asserted"}
+  ],
+  "timing": {"total_ms": 2395.26, "detection_ms": 1870.71, "segmentation_ms": 245.38,
+             "color_ms": 276.21, "material_ms": 1.38},
   "error": null
 }
 ```
 
+The whole body is about 11 KB, of which the mask accounts for roughly 4.4 KB.
+
 `similarity` is a **distance-based score in [0, 1]**, not a calibrated
 probability - it is named accordingly and must not be presented as a confidence.
+`fire_class.confidence` is that same material similarity carried through the
+class mapping, not an independent classification score.
+
+### Field notes
+
+- **Mask vs. bounding box.** `fire_detection.bounding_box` (alias `bbox`) is the
+  *detection rectangle*. `segmentation.mask` is the *actual segmented flame
+  region*, returned as a base64 PNG whose decoded size is exactly
+  `mask_width` x `mask_height` - the analysed image's own dimensions - so a
+  client can overlay it directly. The two are independent.
+- **Mask encoding.** `mask` is a bare base64 string, not a data URI; prefix it
+  with `data:image/png;base64,`. `mask_encoding` names the format and is
+  currently always `png_base64`. A binary mask compresses very well: a 966x681
+  mask of 44,820 pixels is about 4.4 KB encoded, far smaller than sending the
+  raw array. Set `FLAME_EMIT_MASK=0` to omit it.
+- **`bbox_fallback_reason`.** Non-null means the segmentation model produced no
+  usable mask and the detection box was rasterised instead, so `mask` is a
+  rectangle rather than real segmentation output. `fallback_used` / `fallback`
+  report the same condition.
+- **`flame_analysis.algorithms`.** Display names of the five retained
+  algorithms, in report order. Every algorithm that ran also appears as a key
+  in `flame_analysis`; a mask too small to cluster sets `skipped_reason`
+  instead. The `method` field inside each result is the machine name
+  (`kmeans`, `bayesian_gmm`, ...).
+- **`representative`.** How that algorithm turned its clusters into the single
+  reported colour - the mean of the centroids for K-Means, the mixture-weighted
+  mean of component means for the GMMs, the mean of the cluster means for
+  Ward-linkage Agglomerative, and so on. It is reported so the number is
+  reproducible rather than opaque.
+- **`dbscan.noise_count`.** Points DBSCAN labelled noise (16 in the example
+  above). The other algorithms report `0`; noise is a DBSCAN concept.
+- **`centroids` / `dominant_color`.** Every cluster of that algorithm with its
+  size and share of the samples, so the dominant-cluster extraction is
+  inspectable rather than a black box.
+- **`compound` is always `null`.** `flame_dataset.json` records agent names
+  (`CO2`, `Water`, `Foam`, `Sand`, `Dry powder`, `Class D powder`,
+  `Water spray`), not chemical identities, so no formulas are invented.
+- **Compatibility aliases.** `bbox` mirrors `bounding_box` and `fallback`
+  mirrors `fallback_used`, so consumers expecting either spelling keep working.
+  `suppression_information` is likewise retained for existing consumers.
 
 ### Errors
 
@@ -247,6 +359,7 @@ variables:
 | --- | --- | --- |
 | `FLAME_DET_MODEL` | `models/OBJ_best.pt` | detection weights |
 | `FLAME_SEG_MODEL` | `models/SEG_best.pt` | segmentation weights |
+| `FLAME_MODEL_DIR` | `models/` | directory holding both weights; the two variables above win |
 | `FLAME_DATASET` | `data/flame_dataset.json` | material database |
 | `FLAME_IMGSZ` | `640` | YOLO inference size |
 | `FLAME_DET_CONF` | `0.4` | detection confidence threshold |
@@ -254,28 +367,79 @@ variables:
 | `FLAME_DET_CLASS` | `0` | class index treated as fire |
 | `FLAME_SEG_RETINA` | `1` | upscale masks to original resolution |
 | `FLAME_BBOX_FALLBACK` | `1` | allow bounding-box mask fallback |
-| `FLAME_N_CLUSTERS` | `2` | fixed cluster count |
+| `FLAME_N_CLUSTERS` | `2` | cluster count for `fixed` k, and the search lower bound |
+| `FLAME_K_SELECTION` | `silhouette` | `silhouette` (search) or `fixed` (always `N_CLUSTERS`) |
+| `FLAME_K_MAX` | `6` | upper bound searched by silhouette selection |
+| `FLAME_K_CAP` | `4` | hard cap on the silhouette winner (`min(best_k, cap)`) |
+| `FLAME_SILHOUETTE_SAMPLES` | `300` | samples used for the silhouette score |
 | `FLAME_MAX_PIXELS` | `2000` | flame pixels sampled for clustering |
 | `FLAME_MIN_PIXELS` | `10` | below this, only the mean colour is used |
+| `FLAME_KMEANS_NINIT` | `10` | K-Means restarts for the final fit |
+| `FLAME_GMM_MAX_ITER` | `100` | GMM EM iterations |
+| `FLAME_BGGMM_MAX_ITER` | `50` | variational Bayesian GMM iterations |
+| `FLAME_BGGMM_REG_COVAR` | `0.001` | Bayesian GMM variance floor (see note below) |
+| `FLAME_DBSCAN_EPS` | `0.5` | DBSCAN radius in **standardised** units |
+| `FLAME_DBSCAN_MIN_SAMPLES` | `3` | DBSCAN `min_samples` floor |
+| `FLAME_DBSCAN_MIN_SAMPLES_DIV` | `50` | adaptive rule: `max(3, n // 50)` |
+| `FLAME_EMIT_MASK` | `1` | include the base64 PNG mask in the response |
+| `FLAME_MASK_PNG_COMPRESSION` | `6` | zlib level for the PNG encoder (0-9) |
 | `FLAME_SIM_SCALE` | `200.0` | LAB distance that maps to similarity 0.0 |
 | `FLAME_MAX_ALTERNATIVES` | `3` | alternative materials returned |
 | `FLAME_DEVICE` | auto | e.g. `0` or `cpu`; unset means CUDA when available |
 | `FLAME_SEED` | `42` | RNG seed for sampling and clustering |
+
+### Parameters that differ from the original script
+
+The clustering algorithms, their hyper-parameters and the k-selection procedure
+are restored from `main.py`, with three deliberate exceptions. All three are
+overridable, so nothing is locked in:
+
+| Setting | Here | Original | Why |
+| --- | --- | --- | --- |
+| `FLAME_MAX_PIXELS` | `2000` | `1000` | Latency cap. `2000` gives silhouette search and DBSCAN more to work with; the real-image pipeline still runs in ~300 ms warm. |
+| `FLAME_KMEANS_NINIT` | `10` | `3` | More restarts make the K-Means centroid more stable. Only affects the final fit; the k search already uses the original `n_init=3`. |
+| `FLAME_GMM_MAX_ITER` | `100` | `50` | GMM occasionally had not converged at 50 on flame LAB tones. |
+
+Two settings are **new**, not restorations:
+
+- `FLAME_BGGMM_REG_COVAR` (`1e-3`) is a variance floor for
+  `BayesianGMM`. scikit-learn's default (`1e-6`) raises on ill-defined
+  covariances, which happens on tightly separated flame tones. The fit is
+  retried with `1e2` and then `1e4` before it is given up on, and the
+  `representative` field says which value was used. Real-image output is
+  unchanged by it.
+- `FLAME_K_SELECTION` lets you fall back to a fixed `k`, which the original
+  pipeline had no equivalent for.
 
 ## Behaviour notes
 
 * **LAB convention** - colours use the `scikit-image` convention (L\* in 0-100,
   D65), which is what `flame_dataset.json` was written in. OpenCV's
   `COLOR_BGR2Lab` scales L\* to 0-255 and must not be mixed with the database.
-* **Clustering** - a fixed `k=2` for K-Means and GMM plus a mean-colour
-  fallback. No silhouette search, no DBSCAN/MeanShift/Agglomerative/VB-GMM.
+* **Clustering** - flame pixels are sampled, converted to LAB, standardised
+  with `StandardScaler`, then run through **five** algorithms: K-Means, GMM,
+  Bayesian GMM, DBSCAN and Agglomerative. `k` is chosen by silhouette score over
+  `[n_clusters, k_max]` and capped at `k_cap`; set `FLAME_K_SELECTION=fixed` for
+  a fixed `k`. Every algorithm reports its own representative colour, dominant
+  cluster and full centroid list. **MeanShift is not used** and is no longer
+  imported anywhere.
+* **Determinism** - `FLAME_SEED` seeds both the pixel sampling and every
+  estimator, so repeated runs on the same image give the same result.
+* **Fire class is derived, not predicted.** `app/fire_classes.py` maps the
+  matched material to a class - Classes A, B, C or D, or `Unclassified` when
+  there is no evidence - with the full 18-material table spelled out in
+  `MATERIAL_FIRE_CLASS` and documented precedence rules. The detection model
+  predicts fire presence only; no claim is made that it predicts a class.
 * **Material matching** - deterministic LAB nearest-reference matching. The
   highest-confidence detection and the highest-confidence mask are used, as in
   the original pipeline.
 * **Suppression data** - copied verbatim from `flame_dataset.json`; nothing is
-  generated or invented.
-* **No image payloads** - masks and flame pixels are never returned. Debug
-  renderers live in `app/visualization.py` and are never called automatically.
+  generated or invented. Agents are reported as dataset names with a mechanism
+  category, and `compound` stays `null` because the dataset has no chemical
+  identities to report.
+* **Masks are returned** as a compact base64 PNG at the source resolution. No
+  raw pixel arrays are ever serialised. Debug renderers live in
+  `app/visualization.py` and are never called automatically.
 * **Models are loaded once** and kept in memory; a single `FlameAnalyzer`
   instance expects sequential calls (Ultralytics predictors hold mutable
   state), so use one instance per worker/container.
