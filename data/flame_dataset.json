@@ -1,0 +1,130 @@
+{
+  "materials": [
+    {
+      "name": "Paper Products(Wood material)",
+      "flame_rgb": [[255, 165, 0], [255, 215, 0]],
+      "flame_lab": [[72.1, 23.4, 78.9], [84.2, 5.7, 78.4]],
+      "possible_extinguishers": ["Water", "CO2", "Foam"],
+      "notes": "Orange to bright yellow flame, burns quickly, carbon-based combustion - use CO2 or water"
+    },
+    {
+      "name": "Wood Materials",
+      "flame_rgb": [[255, 140, 0], [255, 193, 37], [255, 165, 0]],
+      "flame_lab": [[66.8, 30.2, 72.1], [79.2, 6.4, 85.2],[72.1, 23.4, 78.9]],
+      "possible_extinguishers": ["Water", "Foam", "CO2"],
+      "notes": "Yellow-orange flame with blue base, hardwood burns steadier than softwood, organic material - use water or CO2"
+    },
+    {
+      "name": "Natural Fibers",
+      "flame_rgb": [[255, 200, 50], [255, 255, 0]],
+      "flame_lab": [[81.2, 8.9, 73.4], [97.1, -21.6, 94.5]],
+      "possible_extinguishers": ["Water", "CO2", "Foam"],
+      "notes": "Yellow flame, cotton burns fast, wool self-extinguishes, natural fiber - use water or CO2"
+    },
+    {
+      "name": "Plastic Materials",
+      "flame_rgb": [[100, 149, 237], [255, 140, 0]],
+      "flame_lab": [[62.1, 13.8, -46.7], [66.8, 30.2, 72.1]],
+      "possible_extinguishers": ["CO2", "Foam", "Water spray"],
+      "notes": "Blue to orange flame variations, melts and drips, synthetic material - use CO2"
+    },
+    {
+      "name": "Foam Materials",
+      "flame_rgb": [[255, 69, 0], [255, 20, 147]],
+      "flame_lab": [[58.3, 68.2, 70.9], [54.2, 73.1, -23.4]],
+      "possible_extinguishers": ["CO2", "Foam", "Water spray"],
+      "notes": "Orange to pink flame with heavy black smoke, rapid spread, synthetic foam - use CO2"
+    },
+    {
+      "name": "Wax Materials",
+      "flame_rgb": [[255, 193, 37], [255, 215, 0]],
+      "flame_lab": [[79.2, 6.4, 85.2], [84.2, 5.7, 78.4]],
+      "possible_extinguishers": ["CO2", "Water", "Foam"],
+      "notes": "Steady yellow flame with blue base, natural wax burns cleaner than synthetic, organic wax - use CO2 or water"
+    },
+    {
+      "name": "Alcohol-Based Products",
+      "flame_rgb": [[173, 216, 230], [200, 220, 255]],
+      "flame_lab": [[84.3, -8.1, -21.2], [87.3, -2.1, -15.8]],
+      "possible_extinguishers": ["CO2", "Water spray", "Foam"],
+      "notes": "Pale blue flame, nearly invisible in daylight, higher alcohol content = paler flame, use CO2 or water spray"
+    },
+    {
+      "name": "Rubber Materials",
+      "flame_rgb": [[255, 69, 0], [255, 20, 147]],
+      "flame_lab": [[58.3, 68.2, 70.9], [54.2, 73.1, -23.4]],
+      "possible_extinguishers": ["Foam", "CO2", "Dry powder"],
+      "notes": "Orange to pink flame with black smoke, natural rubber has sulfur odor, synthetic varies, use CO2 or foam"
+    },
+    {
+      "name": "Carpet Materials",
+      "flame_rgb": [[255, 255, 0], [255, 100, 50]],
+      "flame_lab": [[97.1, -21.6, 94.5], [62.1, 45.2, 58.7]],
+      "possible_extinguishers": ["Water", "CO2", "Foam"],
+      "notes": "Wool = yellow self-extinguishing flame, synthetic = orange melting flame - wool use water, synthetic use CO2"
+    },
+    {
+      "name": "Electrical Components",
+      "flame_rgb": [[0, 255, 127], [100, 149, 237]],
+      "flame_lab": [[91.1, -48.1, 14.2], [62.1, 13.8, -46.7]],
+      "possible_extinguishers": ["CO2", "Foam"],
+      "notes": "Green from copper wiring, blue from plastic insulation, never use water on live circuits"
+    },
+    {
+      "name": "Adhesive Materials",
+      "flame_rgb": [[255, 165, 0], [100, 149, 237]],
+      "flame_lab": [[72.1, 23.4, 78.9], [62.1, 13.8, -46.7]],
+      "possible_extinguishers": ["CO2", "Foam", "Water spray"],
+      "notes": "Paper-based = orange flame, plastic-based = blue flame, use appropriate extinguisher for base material"
+    },
+    {
+      "name": "Organic Waste",
+      "flame_rgb": [[255, 200, 0], [255, 255, 0]],
+      "flame_lab": [[82.0, 10.0, 80.0], [97.1, -21.6, 94.5]],
+      "possible_extinguishers": ["Water", "CO2", "Foam"],
+      "notes": "Bright yellow flame, dry organic burns faster than moist, carbon-based material - use water"
+    },
+    {
+      "name": "Food Products",
+      "flame_rgb": [[255, 140, 0], [255, 255, 0]],
+      "flame_lab": [[66.8, 30.2, 72.1], [97.1, -21.6, 94.5]],
+      "possible_extinguishers": ["Water", "CO2", "Foam"],
+      "notes": "Sugar = orange flame, starch = yellow flame, varies by composition, organic material - use water or CO2"
+    },
+    {
+      "name": "Spray Products",
+      "flame_rgb": [[100, 149, 237], [173, 216, 230]],
+      "flame_lab": [[62.1, 13.8, -46.7], [84.3, -8.1, -21.2]],
+      "possible_extinguishers": ["CO2", "Water spray", "Foam"],
+      "notes": "Blue flame from propellant, brief intense burn, use CO2"
+    },
+    {
+      "name": "Composite Materials",
+      "flame_rgb": [[255, 165, 0], [0, 255, 127]],
+      "flame_lab": [[72.1, 23.4, 78.9], [91.1, -48.1, 14.2]],
+      "possible_extinguishers": ["CO2", "Foam", "Water"],
+      "notes": "Fiberglass = orange from resin, vinyl = green tinge, use extinguisher for dominant material"
+    },
+    {
+      "name": "Liquid Fuels",
+      "flame_rgb": [[100, 149, 237], [255, 140, 0]],
+      "flame_lab": [[62.1, 13.8, -46.7], [66.8, 30.2, 72.1]],
+      "possible_extinguishers": ["Foam", "CO2", "Dry powder"],
+      "notes": "Light fuels = blue flame, heavy fuels = orange with smoke, petroleum-based - use foam or CO2, never water"
+    },
+    {
+      "name": "Metal Objects",
+      "flame_rgb": [[255, 140, 0], [0, 255, 146]],
+      "flame_lab": [[66.8, 30.2, 72.1], [91.1, -48.1, 14.2]],
+      "possible_extinguishers": ["Class D powder", "Sand"],
+      "notes": "Iron = orange sparks, copper = green flame, requires very high temperature - use sand or Class D powder"
+    },
+    {
+      "name": "Chemical Products",
+      "flame_rgb": [[100, 149, 237], [255, 140, 0]],
+      "flame_lab": [[62.1, 13.8, -46.7], [66.8, 30.2, 72.1]],
+      "possible_extinguishers": ["CO2", "Foam", "Water spray"],
+      "notes": "Solvents typically blue, cleaners may be orange, check product label for specific guidance"
+    }
+  ]
+}
