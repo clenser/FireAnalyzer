@@ -134,6 +134,23 @@ class Settings:
         Browser origins allowed to call the API.  Empty (the default) means CORS
         is disabled entirely, which is the right setting for a server-to-server
         deployment.  ``("*",)`` allows any origin *without* credentials.
+    gemini_enabled:
+        Opt in to the *secondary* Gemini material analysis (see
+        :mod:`app.gemini_analysis`).  Defaults to ``False``: the deterministic
+        FlameAnalyzer pipeline is unchanged unless this is explicitly enabled.
+    gemini_api_key:
+        API key for the Gemini API.  Read from ``GEMINI_API_KEY`` only - it is
+        never hardcoded, never logged and never sent to the frontend.  When
+        ``gemini_enabled`` is true and this is missing, the AI analysis reports
+        ``{"available": false, ...}`` and the deterministic result is returned
+        untouched.
+    gemini_model:
+        Gemini model used for the secondary analysis.  Defaults to
+        ``gemini-3.5-flash-lite``.
+    gemini_timeout_s:
+        Hard timeout for one Gemini request.  A slow or hung request is abandoned
+        after this many seconds and reported as an unavailable AI analysis; it
+        never blocks the ``/analyze`` response indefinitely.
     """
 
     # --- artifacts -----------------------------------------------------
@@ -187,6 +204,12 @@ class Settings:
     max_image_mb: int = 10
     cors_origins: tuple[str, ...] = ()
 
+    # --- Gemini (secondary AI material analysis) -------------------------
+    gemini_enabled: bool = False
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_timeout_s: float = 30.0
+
     # ------------------------------------------------------------------
     @classmethod
     def from_env(cls) -> "Settings":
@@ -229,6 +252,10 @@ class Settings:
             ultralytics_verbose=_env_bool("FLAME_YOLO_VERBOSE", False),
             max_image_mb=_env_int("FLAME_MAX_IMAGE_MB", 10),
             cors_origins=_env_list("FLAME_CORS_ORIGINS"),
+            gemini_enabled=_env_bool("GEMINI_ENABLED", False),
+            gemini_api_key=os.environ.get("GEMINI_API_KEY") or None,
+            gemini_model=os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash-lite",
+            gemini_timeout_s=_env_float("GEMINI_TIMEOUT_S", 30.0),
         )
 
     def with_overrides(self, **kwargs: object) -> "Settings":

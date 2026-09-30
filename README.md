@@ -4,9 +4,16 @@ Headless, cloud-ready flame analysis:
 **detection -> segmentation -> flame colour (CIELAB, five clustering
 algorithms) -> material matching -> fire class -> JSON**.
 
-There is no GUI, no browser UI, no tunnel and no LLM call anywhere in the
-request path. The ML pipeline is transport-agnostic; a thin FastAPI layer
-(`app/api.py`) and a CLI (`app/cli.py`) sit on top of it.
+There is no GUI, no browser UI and no tunnel. The ML pipeline is
+transport-agnostic; a thin FastAPI layer (`app/api.py`) and a CLI
+(`app/cli.py`) sit on top of it.
+
+Optionally, the API can attach a **secondary AI material analysis**
+(`ai_material_analysis`, powered by Gemini) alongside the deterministic
+result. It is strictly additive: it receives only the extracted mean flame
+RGB/LAB values and the canonical material vocabulary - never the image - and
+any Gemini failure degrades to `{"available": false}` without affecting the
+deterministic result. See [AI Material Analysis](#ai-material-analysis-secondary-gemini-powered).
 
 ```
 HTTP request                                     CLI
@@ -32,6 +39,7 @@ flame-analyzer/
 │   ├── detection.py          # OBJ_best.pt fire detection
 │   ├── errors.py             # AnalysisError hierarchy + error codes
 │   ├── fire_classes.py       # material -> fire class + extinguishing agents
+│   ├── gemini_analysis.py    # secondary Gemini material analysis (optional, additive)
 │   ├── imaging.py            # image validation / bytes -> BGR decoding
 │   ├── mask.py               # mask -> base64 PNG codec (MASK_ENCODING)
 │   ├── material_matching.py  # LAB matching against flame_dataset.json
@@ -43,9 +51,12 @@ flame-analyzer/
 │   └── SEG_best.pt           # custom flame segmentation model (do not replace)
 ├── data/
 │   └── flame_dataset.json    # material database (reference flame colours + suppression data)
+├── frontend/
+│   └── index.html            # minimal reference UI: deterministic + AI material cards
 ├── tests/
 │   ├── test_pipeline.py      # pipeline tests + real-weight integration test
-│   └── test_api.py           # FastAPI TestClient tests (stubbed analyzer)
+│   ├── test_api.py           # FastAPI TestClient tests (stubbed analyzer)
+│   └── test_gemini_analysis.py  # secondary AI analysis tests (mocked Gemini client)
 ├── main.py                   # CLI entry point
 ├── test_pipeline.py          # same CLI, kept as the standalone smoke-test script
 ├── requirements.txt
@@ -70,8 +81,9 @@ python main.py fire_1.jpg
 python test_pipeline.py fire_1.jpg --pretty --verbose
 ```
 
-Run the test suite (105 tests: pipeline, API, CLI, plus a real-weight
-integration test that is skipped when the `.pt` files are absent):
+Run the test suite (129 tests: pipeline, API, CLI, Gemini analysis with a
+mocked client, plus a real-weight integration test that is skipped when the
+`.pt` files are absent):
 
 ```bash
 pip install pytest httpx
@@ -279,10 +291,28 @@ repetitive fields abbreviated as `"..."`. Re-running
      "compound_basis": "name verbatim from flame_dataset.json; the dataset records no chemical identity, so no compound formula is asserted"}
   ],
   "timing": {"total_ms": 2395.26, "detection_ms": 1870.71, "segmentation_ms": 245.38,
-             "color_ms": 276.21, "material_ms": 1.38},
+              "color_ms": 276.21, "material_ms": 1.38, "ai_material_ms": 412.7},
+  "ai_material_analysis": {
+    "available": true,
+    "primary_material": "Wood Materials",
+    "matches": [
+      {"rank": 1, "material": "Wood Materials", "confidence_percent": 78.0,
+       "reason": "Yellow-orange flame with a blue base matches the measured colour."},
+      {"rank": 2, "material": "Paper Products(Wood material)", "confidence_percent": 71.0,
+       "reason": "Orange to bright yellow flame is compatible with the measured tone."}
+    ],
+    "overall_confidence_level": "medium",
+    "uncertain": false,
+    "reasoning_summary": "The measured yellow-orange flame is most compatible with organic, carbon-based materials; flame colour alone is not a reliable identification."
+  },
   "error": null
 }
 ```
+
+`ai_material_analysis` is present in every successful response. When Gemini is
+disabled it is `{"available": false, "error": "Gemini material analysis is
+disabled (GEMINI_ENABLED is not enabled)."}` and `timing` carries no
+`ai_material_ms` key.
 
 The whole body is about 11 KB, of which the mask accounts for roughly 4.4 KB.
 
@@ -350,6 +380,48 @@ Failures return HTTP-friendly JSON and never a stack trace:
 | `MISSING_DATABASE` | `flame_dataset.json` missing or malformed |
 | `INFERENCE_ERROR` | Unexpected failure (details logged internally only) |
 
+## AI Material Analysis (secondary, Gemini-powered)
+
+`ai_material_analysis` is a **secondary, LLM-based interpretation** of the
+numerically extracted flame-colour evidence. It is independent from the
+deterministic matcher and is never allowed to alter the fire class, the
+extinguishing agents or the deterministic `material_analysis`.
+
+- **The original image is not sent to Gemini.** No image, no segmentation mask
+  and no base64 data ever leave the backend. Gemini receives only the final
+  whole-mask flame colour (`flame_analysis.mean_color`: mean RGB and mean LAB,
+  exactly as `FlameAnalyzer` extracted them) plus the canonical material
+  vocabulary and notes loaded from the same `flame_dataset.json`.
+- **The vocabulary is fixed.** Gemini may only choose from the 18 canonical
+  dataset categories; every response is validated against the vocabulary, the
+  rank sequence (1-5) and the confidence range `[0, 100]`. Unknown materials,
+  duplicates, wrong ranks, wrong candidate counts and malformed JSON are all
+  rejected into a clean `{"available": false, "error": ...}` state.
+- **The scores are heuristic.** `confidence_percent` values are the model's
+  relative confidence allocation. They are **not calibrated probabilities** and
+  are never derived from token probabilities.
+- **Failure never fails the request.** If Gemini is disabled
+  (`GEMINI_ENABLED=0`, the default), the API key is missing, the free-tier
+  quota is exhausted, the request times out (`GEMINI_TIMEOUT_S`, default 30 s)
+  or the payload fails validation, the deterministic FlameAnalyzer result is
+  returned untouched and `ai_material_analysis.available` is `false`.
+- **Timing** is reported separately as `timing.ai_material_ms`, only when the
+  AI analysis actually ran.
+
+The CLI is unaffected: it prints the deterministic `FlameAnalyzer` payload;
+the AI analysis is attached by the API layer.
+
+### Reference UI
+
+`frontend/index.html` is a minimal standalone page (no build step). Serve it
+from the API origin, or open it behind any static server pointed at the API,
+and it renders two separate cards: **Material Identification** (Powered by
+FlameAnalyzer, the deterministic result) and **AI Material Analysis** (Powered
+by Gemini, with the top match, confidence, top-5 list, overall confidence
+level, reasoning summary and the "heuristic AI scores, not calibrated
+probabilities" disclaimer). When Gemini is unavailable the AI card shows
+"Currently unavailable" and the deterministic card keeps working.
+
 ## Configuration
 
 Every parameter lives in `app/config.py` and can be overridden with environment
@@ -387,6 +459,10 @@ variables:
 | `FLAME_MAX_ALTERNATIVES` | `3` | alternative materials returned |
 | `FLAME_DEVICE` | auto | e.g. `0` or `cpu`; unset means CUDA when available |
 | `FLAME_SEED` | `42` | RNG seed for sampling and clustering |
+| `GEMINI_ENABLED` | `0` | master switch for the secondary AI material analysis |
+| `GEMINI_API_KEY` | – | Gemini API key; never hardcoded, logged or sent to the frontend |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | model used for the secondary analysis |
+| `GEMINI_TIMEOUT_S` | `30` | hard timeout for one Gemini request |
 
 ### Parameters that differ from the original script
 
@@ -433,6 +509,13 @@ Two settings are **new**, not restorations:
 * **Material matching** - deterministic LAB nearest-reference matching. The
   highest-confidence detection and the highest-confidence mask are used, as in
   the original pipeline.
+* **AI material analysis** - optional secondary Gemini opinion
+  (`app/gemini_analysis.py`). It receives only the extracted mean RGB/LAB flame
+  colour and the canonical vocabulary from `flame_dataset.json` - never the
+  image - and is validated against that vocabulary. Its confidence percentages
+  are heuristic scores, not calibrated probabilities, and any Gemini failure
+  degrades to `ai_material_analysis: {available: false}` without affecting the
+  deterministic result.
 * **Suppression data** - copied verbatim from `flame_dataset.json`; nothing is
   generated or invented. Agents are reported as dataset names with a mechanism
   category, and `compound` stays `null` because the dataset has no chemical

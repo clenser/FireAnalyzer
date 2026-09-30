@@ -34,6 +34,11 @@ scikit-image>=0.22.0
 # StandardScaler and the silhouette score.
 scikit-learn>=1.3.0
 
+# Secondary AI material analysis (app/gemini_analysis.py). Optional at runtime:
+# the deterministic pipeline runs fine without it, and the module degrades to
+# ai_material_analysis: {available: false} when Gemini is disabled.
+google-genai>=1.0.0
+
 # --- Test-only (not part of the runtime) --------------------------------
 #   pip install pytest httpx
 #   python -m pytest tests -q

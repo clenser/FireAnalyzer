@@ -186,6 +186,10 @@ SUCCESS_RESULT = {
         "color_ms": 19.0,
         "material_ms": 0.9,
     },
+    "ai_material_analysis": {
+        "available": False,
+        "error": "Gemini material analysis is disabled (GEMINI_ENABLED is not enabled).",
+    },
     "error": None,
 }
 
@@ -229,7 +233,10 @@ def _png_bytes(size: int = 96, color=(0, 140, 255)) -> bytes:
 
 
 def _client(stub: StubAnalyzer, **overrides) -> TestClient:
-    settings = Settings.from_env().with_overrides(**overrides) if overrides else Settings.from_env()
+    # Gemini stays off unless a test explicitly enables it, so the shared
+    # fixture is deterministic regardless of the ambient environment.
+    overrides.setdefault("gemini_enabled", False)
+    settings = Settings.from_env().with_overrides(**overrides)
     application = create_app(settings=settings, analyzer_factory=lambda: stub)
     return TestClient(application)
 
