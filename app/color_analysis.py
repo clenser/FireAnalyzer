@@ -40,11 +40,17 @@ Methodology notes
   ``silhouette_sample_size`` rows, and caps the winner at ``k_cap``.
   ``k_selection="fixed"`` always uses ``n_clusters``.  Either way ``n_clusters``
   is the floor and the fallback, so ``k`` is always defined.
-* **Representative colour** - derived the way the original derived it, per
-  algorithm: mixture weights for GMM and Bayesian GMM, the unweighted mean of
-  the K-Means centroids, and the unweighted mean of the per-cluster means for
-  DBSCAN and Agglomerative.  DBSCAN noise points are excluded, and an all-noise
-  result falls back to the overall mean, as in the original.
+ * **Representative colour** - derived the way the original derived it, per
+   algorithm: mixture weights for GMM and Bayesian GMM, the unweighted mean of
+   the K-Means centroids, and the unweighted mean of the per-cluster means for
+   DBSCAN and Agglomerative.  DBSCAN noise points are excluded, and an all-noise
+   result falls back to the overall mean, as in the original.
+ * **Final (mean) colour** - not one global mask average.  The flame mask is
+   split by Euclidean Distance Transform depth into INNER (deepest 40% of
+   pixels), MIDDLE (next 35%) and OUTER (outermost 25%); RGB and LAB are
+   averaged independently per zone and combined as
+   ``0.40*inner + 0.35*middle + 0.25*outer``.  The zone breakdown is kept on
+   ``FlameColorResult.zones`` for testing.
 * **Cluster centroids / dominant cluster** - every algorithm reports its
   per-cluster centroids, sizes and weights plus the dominant cluster, so the
   dominant-cluster extraction is inspectable rather than implicit.
@@ -65,8 +71,10 @@ from __future__ import annotations
 import logging
 import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from typing import Any
 
+import cv2
 import numpy as np
 from skimage import color as skcolor
 from sklearn.cluster import AgglomerativeClustering, DBSCAN, KMeans
@@ -130,6 +138,12 @@ METHOD_LABELS: dict[str, str] = {
 
 #: ``k_selection`` modes accepted by :class:`app.config.Settings`.
 K_SELECTION_MODES: tuple[str, ...] = ("silhouette", "fixed")
+
+#: Zone weights for the final flame colour.  The flame mask is split by EDT
+#: depth into INNER (deepest 40%), MIDDLE (next 35%) and OUTER (outermost 25%)
+#: and the final RGB/LAB is the weighted combination of the three zone means.
+#: These are weights for the final value, not material-class probabilities.
+ZONE_WEIGHTS: tuple[float, float, float] = (0.40, 0.35, 0.25)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +213,8 @@ class FlameColorResult:
     n_clusters: int
     methods: Mapping[str, MethodResult]
     mean: RepresentativeColor
+    #: 40/35/25 EDT zone breakdown behind ``mean`` (internal/test use only).
+    zones: dict[str, Any] = field(default_factory=dict)
 
     def get(self, method: str) -> MethodResult | None:
         """The full :class:`MethodResult` for ``method``, if it ran."""
@@ -602,6 +618,106 @@ def _agglomerative_result(
 
 
 # ---------------------------------------------------------------------------
+# 40/35/25 EDT zone-weighted final colour
+# ---------------------------------------------------------------------------
+def _flame_depths(mask: np.ndarray) -> np.ndarray:
+    """Euclidean distance of every flame pixel from the mask boundary.
+
+    ``cv2.distanceTransform`` measures, for every non-zero pixel, the distance
+    to the nearest zero pixel - i.e. how deep inside the flame each pixel is.
+    The result is returned in the same row-major order as
+    :func:`extract_flame_pixels`, so ``depths[i]`` belongs to ``pixels[i]``.
+    """
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if not binary.any():
+        return np.empty(0, dtype=np.float64)
+    edt = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
+    return edt[binary.astype(bool)]
+
+
+def _zone_indices(depths: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rank flame pixels by EDT depth and split into INNER/MIDDLE/OUTER.
+
+    The deepest 40% of pixels form INNER, the next 35% MIDDLE and the
+    outermost 25% OUTER.  Ties (large plateaus of equal depth are common) are
+    broken deterministically by the stable sort's original order.
+    """
+    order = np.argsort(-depths, kind="stable")
+    total = int(depths.shape[0])
+    n_inner = int(round(ZONE_WEIGHTS[0] * total))
+    n_middle = int(round(ZONE_WEIGHTS[1] * total))
+    inner = order[:n_inner]
+    middle = order[n_inner : n_inner + n_middle]
+    outer = order[n_inner + n_middle :]
+    return inner, middle, outer
+
+
+def _zone_weighted_mean_color(
+    samples: np.ndarray, lab_samples: np.ndarray, depths: np.ndarray
+) -> tuple[RepresentativeColor, dict[str, Any]]:
+    """Final flame colour from the 40/35/25 EDT zones.
+
+    RGB and LAB are averaged *independently per zone* from the pixels in that
+    zone, then combined as ``0.40*inner + 0.35*middle + 0.25*outer``.  No global
+    average is computed first and LAB is never derived from the weighted RGB.
+
+    Edge case: when the mask is too small to fill all three zones (fewer than
+    3 sampled pixels), an empty zone falls back to the global flame mean so
+    the weighted combination stays defined.  No pixel values are invented.
+    """
+    global_rgb = np.mean(samples, axis=0)
+    global_lab = np.mean(lab_samples, axis=0)
+    inner_idx, middle_idx, outer_idx = _zone_indices(depths)
+
+    zone_rgb: dict[str, np.ndarray] = {}
+    zone_lab: dict[str, np.ndarray] = {}
+    for name, indices in (
+        ("inner", inner_idx),
+        ("middle", middle_idx),
+        ("outer", outer_idx),
+    ):
+        if indices.size:
+            zone_rgb[name] = np.mean(samples[indices], axis=0)
+            zone_lab[name] = np.mean(lab_samples[indices], axis=0)
+        else:
+            zone_rgb[name] = global_rgb
+            zone_lab[name] = global_lab
+
+    weights = ZONE_WEIGHTS
+    ultimate_rgb = (
+        weights[0] * zone_rgb["inner"]
+        + weights[1] * zone_rgb["middle"]
+        + weights[2] * zone_rgb["outer"]
+    )
+    ultimate_lab = (
+        weights[0] * zone_lab["inner"]
+        + weights[1] * zone_lab["middle"]
+        + weights[2] * zone_lab["outer"]
+    )
+    color = RepresentativeColor(
+        method="mean",
+        rgb=np.clip(np.round(ultimate_rgb), 0, 255).astype(np.uint8),
+        lab=ultimate_lab,
+    )
+    zones = {
+        "inner_rgb": [round(float(v), 2) for v in zone_rgb["inner"]],
+        "middle_rgb": [round(float(v), 2) for v in zone_rgb["middle"]],
+        "outer_rgb": [round(float(v), 2) for v in zone_rgb["outer"]],
+        "inner_lab": [round(float(v), 2) for v in zone_lab["inner"]],
+        "middle_lab": [round(float(v), 2) for v in zone_lab["middle"]],
+        "outer_lab": [round(float(v), 2) for v in zone_lab["outer"]],
+        "ultimate_rgb": [int(v) for v in color.rgb],
+        "ultimate_lab": [round(float(v), 2) for v in color.lab],
+        "zone_pixel_counts": {
+            "inner": int(inner_idx.size),
+            "middle": int(middle_idx.size),
+            "outer": int(outer_idx.size),
+        },
+    }
+    return color, zones
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 def analyze_flame_colors(
@@ -622,9 +738,13 @@ def analyze_flame_colors(
         empty = RepresentativeColor("mean", np.zeros(3, np.uint8), np.zeros(3, np.float64))
         return FlameColorResult(0, 0, False, 0, {}, empty)
 
+    depths = _flame_depths(mask)
     samples, sampled = subsample(pixels, settings.max_flame_pixels, settings.random_seed)
+    # Same seed and same row count -> same indices as the pixel subsample, so
+    # sample_depths stays aligned with samples.
+    sample_depths, _ = subsample(depths, settings.max_flame_pixels, settings.random_seed)
     lab_samples = _to_lab(samples)  # single conversion, shared by every algorithm
-    mean_color = _to_lab_color(np.mean(lab_samples, axis=0), "mean")
+    mean_color, zones = _zone_weighted_mean_color(samples, lab_samples, sample_depths)
     assert mean_color is not None  # mean of finite rows is always finite
 
     if pixel_count < max(settings.min_flame_pixels, settings.n_clusters):
@@ -636,6 +756,7 @@ def analyze_flame_colors(
             n_clusters=0,
             methods={},
             mean=mean_color,
+            zones=zones,
         )
 
     scaler = StandardScaler().fit(lab_samples)
@@ -667,4 +788,5 @@ def analyze_flame_colors(
         n_clusters=k,
         methods=methods,
         mean=mean_color,
+        zones=zones,
     )
