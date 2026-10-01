@@ -4,6 +4,10 @@ Every test mocks the Gemini client - the real API is never called.  The stub
 client mimics the ``google-genai`` surface the module uses
 (``client.models.generate_content(...)`` returning an object with ``.text``).
 
+The evidence fed to Gemini is built with the real
+:func:`app.flame_evidence.extract_flame_evidence` from a realistic analyzer
+result, so the tests exercise the same evidence path the API layer uses.
+
 Run with::
 
     python -m pytest tests -q
@@ -25,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.api import create_app  # noqa: E402
 from app.config import Settings  # noqa: E402
+from app.flame_evidence import extract_flame_evidence, rgb_to_hsv  # noqa: E402
 from app.gemini_analysis import gemini_material_analysis  # noqa: E402
 from app.material_matching import load_material_database  # noqa: E402
 from tests.test_api import SUCCESS_RESULT, StubAnalyzer, _png_bytes  # noqa: E402
@@ -32,8 +37,9 @@ from tests.test_api import SUCCESS_RESULT, StubAnalyzer, _png_bytes  # noqa: E40
 ROOT = Path(__file__).resolve().parent.parent
 DATASET = ROOT / "data" / "flame_dataset.json"
 
-#: The exact evidence the real Gemini run uses (task specification).
-MEAN_COLOR = {"rgb": [185, 150, 110], "lab": [64.3, 7.9, 26.0]}
+#: The exact evidence the real Gemini run uses (task specification): a pale,
+#: low-saturation flame whose RGB/LAB could be mistaken for Wood/Paper.
+MEAN_COLOR = {"rgb": [194, 174, 143], "lab": [72.0, 2.6, 18.5]}
 
 CANONICAL_MATERIALS = [
     "Wood Materials",
@@ -84,8 +90,33 @@ def _valid_payload(materials=None, **overrides) -> dict:
         ],
         "overall_confidence_level": "medium",
         "uncertain": False,
+        "evidence_quality": "moderate",
         "reasoning_summary": "The measured yellow-orange flame colour is most compatible with organic, carbon-based materials.",
     }
+    payload.update(overrides)
+    return payload
+
+
+def _uncertain_payload(**overrides) -> dict:
+    """A payload for evidence that cannot distinguish materials (tests A/C/D)."""
+    payload = _valid_payload(
+        primary_material=None,
+        overall_confidence_level="low",
+        uncertain=True,
+        evidence_quality="insufficient",
+        reasoning_summary=(
+            "The measured flame characteristics are insufficient for reliable material "
+            "identification: several canonical materials produce visually similar flames, "
+            "and flame colour alone cannot distinguish them."
+        ),
+    )
+    # Low, evenly spread confidences: the candidates are plausible, not supported.
+    for index, match in enumerate(payload["matches"]):
+        match["confidence_percent"] = 25.0 - index * 3.0
+        match["reason"] = (
+            f"candidate {index + 1} is visually plausible but the evidence does not "
+            "distinguish it from the other candidates"
+        )
     payload.update(overrides)
     return payload
 
@@ -100,16 +131,30 @@ def _database():
     return load_material_database(DATASET)
 
 
-def _analyze(mean_color=None, settings=None, database=None, handler=None, monkeypatch=None):
-    """Run the Gemini analysis with a mocked client; returns (payload, calls)."""
+def _sample_result() -> dict:
+    """A realistic analyzer result carrying the representative evidence."""
+    result = copy.deepcopy(SUCCESS_RESULT)
+    result["flame_analysis"]["mean_color"] = {
+        "rgb": list(MEAN_COLOR["rgb"]),
+        "lab": list(MEAN_COLOR["lab"]),
+    }
+    return result
+
+
+def _evidence() -> dict:
+    """The evidence the API layer would extract from ``_sample_result``."""
+    return extract_flame_evidence(_sample_result())
+
+
+def _analyze(evidence=None, settings=None, database=None, handler=None, monkeypatch=None):
+    """Run the Gemini analysis with a mocked client; returns the payload."""
     settings = settings or _settings()
     database = database if database is not None else _database()
     if handler is not None:
         monkeypatch.setattr(
             "app.gemini_analysis._create_client", lambda _settings: _StubClient(handler)
         )
-    payload = gemini_material_analysis(mean_color or MEAN_COLOR, settings, database)
-    return payload
+    return gemini_material_analysis(evidence if evidence is not None else _evidence(), settings, database)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +172,12 @@ def test_missing_api_key_returns_unavailable(monkeypatch):
     assert "GEMINI_API_KEY" in payload["error"]
 
 
+def test_missing_evidence_returns_unavailable(monkeypatch):
+    payload = _analyze(evidence={}, settings=_settings(), monkeypatch=monkeypatch)
+    assert payload["available"] is False
+    assert "No flame colour evidence" in payload["error"]
+
+
 # ---------------------------------------------------------------------------
 # 3-4. Success + structured JSON parsing
 # ---------------------------------------------------------------------------
@@ -136,6 +187,7 @@ def test_successful_gemini_response(monkeypatch):
     assert payload["primary_material"] == "Wood Materials"
     assert payload["overall_confidence_level"] == "medium"
     assert payload["uncertain"] is False
+    assert payload["evidence_quality"] == "moderate"
     assert payload["reasoning_summary"]
     assert len(payload["matches"]) == 5
 
@@ -151,13 +203,12 @@ def test_structured_json_is_parsed_into_typed_fields(monkeypatch):
 
 
 def test_malformed_json_is_rejected_cleanly(monkeypatch):
-    payload = _analyze(handler=_ok_handler(None), monkeypatch=monkeypatch)
     # _ok_handler(None) still returns valid JSON; break the text explicitly.
     monkeypatch.setattr(
         "app.gemini_analysis._create_client",
         lambda _s: _StubClient(lambda **kw: SimpleNamespace(text="not json {")),
     )
-    payload = gemini_material_analysis(MEAN_COLOR, _settings(), _database())
+    payload = gemini_material_analysis(_evidence(), _settings(), _database())
     assert payload["available"] is False
     assert "not valid JSON" in payload["error"]
 
@@ -230,6 +281,68 @@ def test_rank1_must_be_the_primary(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Uncertainty behaviour (task tests A-D): null primary, ambiguous evidence
+# ---------------------------------------------------------------------------
+def test_uncertain_payload_with_null_primary_is_accepted(monkeypatch):
+    """A. Strongly ambiguous evidence -> Gemini may return uncertain/null."""
+    payload = _analyze(handler=_ok_handler(_uncertain_payload()), monkeypatch=monkeypatch)
+    assert payload["available"] is True
+    assert payload["primary_material"] is None
+    assert payload["uncertain"] is True
+    assert payload["overall_confidence_level"] == "low"
+    assert payload["evidence_quality"] == "insufficient"
+    assert "insufficient" in payload["reasoning_summary"].lower()
+    assert len(payload["matches"]) == 5
+
+
+def test_multiple_plausible_candidates_with_low_confidence(monkeypatch):
+    """C. Multiple plausible materials -> several candidates, low confidence."""
+    payload = _analyze(
+        handler=_ok_handler(_uncertain_payload(evidence_quality="limited")),
+        monkeypatch=monkeypatch,
+    )
+    assert payload["available"] is True
+    assert payload["primary_material"] is None
+    assert payload["uncertain"] is True
+    assert payload["evidence_quality"] == "limited"
+    assert len(payload["matches"]) == 5
+    assert all(match["confidence_percent"] <= 30.0 for match in payload["matches"])
+    assert {match["material"] for match in payload["matches"]} <= {
+        entry.name for entry in _database().entries
+    }
+
+
+def test_null_primary_claiming_certainty_is_rejected(monkeypatch):
+    """D. A null primary must come with uncertain=true and level=low."""
+    payload = _uncertain_payload(uncertain=False)
+    result = _analyze(handler=_ok_handler(payload), monkeypatch=monkeypatch)
+    assert result["available"] is False
+    assert "null primary_material" in result["error"]
+
+
+def test_null_primary_with_non_low_level_is_rejected(monkeypatch):
+    payload = _uncertain_payload(overall_confidence_level="medium")
+    result = _analyze(handler=_ok_handler(payload), monkeypatch=monkeypatch)
+    assert result["available"] is False
+    assert "null primary_material" in result["error"]
+
+
+def test_invalid_evidence_quality_is_rejected(monkeypatch):
+    payload = _valid_payload(evidence_quality="excellent")
+    result = _analyze(handler=_ok_handler(payload), monkeypatch=monkeypatch)
+    assert result["available"] is False
+    assert "evidence_quality" in result["error"]
+
+
+def test_missing_evidence_quality_is_rejected(monkeypatch):
+    payload = _valid_payload()
+    del payload["evidence_quality"]
+    result = _analyze(handler=_ok_handler(payload), monkeypatch=monkeypatch)
+    assert result["available"] is False
+    assert "evidence_quality" in result["error"]
+
+
+# ---------------------------------------------------------------------------
 # 9-10. Timeout / API exception
 # ---------------------------------------------------------------------------
 def test_gemini_timeout_returns_unavailable(monkeypatch):
@@ -276,6 +389,9 @@ def test_dataset_vocabulary_is_enforced(monkeypatch):
     assert payload["primary_material"] in canonical
 
 
+# ---------------------------------------------------------------------------
+# Prompt design: evidence-based, uncertainty-aware, never colour-alone
+# ---------------------------------------------------------------------------
 def test_prompt_carries_evidence_and_vocabulary_but_no_image(monkeypatch):
     captured: list[dict] = []
 
@@ -289,8 +405,17 @@ def test_prompt_carries_evidence_and_vocabulary_but_no_image(monkeypatch):
     call = captured[0]
     contents = call["contents"]
     # The measured evidence is forwarded verbatim.
-    assert "[185, 150, 110]" in contents
-    assert "[64.3, 7.9, 26.0]" in contents
+    assert "[194, 174, 143]" in contents
+    assert "[72.0, 2.6, 18.5]" in contents
+    # The additional extracted evidence is present.
+    assert "HSV" in contents
+    assert "brightness" in contents
+    assert "saturation" in contents
+    assert "flame pixels" in contents
+    assert "Fire detection confidence" in contents
+    assert "Segmentation confidence" in contents
+    assert "bounding box" in contents
+    assert "clusters" in contents
     # The full canonical vocabulary is supplied.
     database = _database()
     for entry in database.entries:
@@ -298,6 +423,122 @@ def test_prompt_carries_evidence_and_vocabulary_but_no_image(monkeypatch):
     # Structured output is requested, and no image/base64 data is sent.
     assert "base64" not in contents.lower()
     assert call["config"].response_mime_type == "application/json"
+
+
+def test_prompt_frames_the_task_as_evidence_sufficiency_not_colour_matching(monkeypatch):
+    """B. The prompt must not ask Gemini to identify the material from RGB/LAB."""
+    captured: list[dict] = []
+
+    def capturing_handler(**kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(text=json.dumps(_valid_payload()))
+
+    _analyze(handler=capturing_handler, monkeypatch=monkeypatch)
+
+    call = captured[0]
+    instruction = call["config"].system_instruction
+    contents = call["contents"]
+    # The uncertainty framing is explicit.
+    assert "not necessarily the fuel itself" in instruction
+    assert "Do not infer material identity from flame color alone" in instruction
+    assert "weak evidence" in instruction
+    assert "null" in instruction
+    assert "insufficient" in instruction
+    # The old colour-alone framing is gone.
+    assert "Use the supplied RGB and CIELAB measurements as the primary evidence" not in contents
+    assert "primary evidence" not in instruction
+    # The user message instructs the model to evaluate distinguishability.
+    assert "distinguish among the candidate materials" in instruction
+    assert "distinguishes among the candidate materials" in contents
+    assert "primary_material to null" in contents
+
+
+# ---------------------------------------------------------------------------
+# Evidence extraction (app/flame_evidence.py)
+# ---------------------------------------------------------------------------
+def test_extract_flame_evidence_forwards_mean_color_and_derives_hsv():
+    evidence = _evidence()
+    assert evidence["mean_color"] == MEAN_COLOR
+    hsv = evidence["hsv"]
+    assert hsv["h"] == pytest.approx(36.5, abs=0.1)
+    assert hsv["s"] == pytest.approx(26.3, abs=0.1)
+    assert hsv["v"] == pytest.approx(76.1, abs=0.1)
+    assert evidence["saturation_0_100"] == hsv["s"]
+    assert evidence["brightness_0_255"] == pytest.approx(0.299 * 194 + 0.587 * 174 + 0.114 * 143, abs=0.1)
+
+
+def test_extract_flame_evidence_collects_region_statistics_and_confidences():
+    evidence = _evidence()
+    region = evidence["flame_region"]
+    assert region["flame_pixel_count"] == SUCCESS_RESULT["flame_analysis"]["flame_pixel_count"]
+    assert region["samples_used"] == 2000
+    assert region["pixels_sampled"] is True
+    assert region["mask_area_ratio"] == pytest.approx(0.1302, abs=1e-4)
+    assert region["mask_width_px"] == 96
+    assert region["mask_height_px"] == 96
+    assert evidence["detection_confidence"] == 0.7899
+    assert evidence["segmentation_confidence"] == 0.9578
+
+
+def test_extract_flame_evidence_collects_bounding_box_geometry():
+    evidence = _evidence()
+    box = evidence["detection_bounding_box"]
+    assert box["width_px"] == 60
+    assert box["height_px"] == 60
+    assert box["aspect_ratio"] == 1.0
+
+
+def test_extract_flame_evidence_collects_clusters_and_dominant_colors():
+    evidence = _evidence()
+    distribution = evidence["color_distribution"]
+    assert distribution["algorithms"] == SUCCESS_RESULT["flame_analysis"]["algorithms"]
+    kmeans = distribution["per_algorithm"]["kmeans"]
+    assert kmeans["cluster_count"] == 2
+    assert kmeans["representative_rgb"] == [255, 203, 89]
+    assert kmeans["dominant_color"]["rgb"] == [255, 214, 105]
+    assert kmeans["clusters"]
+    assert all("pixel_share" in cluster for cluster in kmeans["clusters"])
+
+
+def test_extract_flame_evidence_omits_missing_fields():
+    result = copy.deepcopy(SUCCESS_RESULT)
+    result["segmentation"]["confidence"] = None
+    result["flame_analysis"]["kmeans"] = None
+    result["flame_analysis"]["gmm"] = None
+    result["flame_analysis"]["bayesian_gmm"] = None
+    result["flame_analysis"]["dbscan"] = None
+    result["flame_analysis"]["agglomerative"] = None
+    result["flame_analysis"]["algorithms"] = []
+    result["flame_analysis"]["skipped_reason"] = "fewer than 10 flame pixels"
+
+    evidence = extract_flame_evidence(result)
+
+    assert "segmentation_confidence" not in evidence
+    assert evidence["color_distribution"]["per_algorithm"] == {}
+    assert "fewer than 10 flame pixels" in str(evidence["color_distribution"]["skipped_reason"])
+
+
+def test_extract_flame_evidence_handles_empty_or_malformed_result():
+    evidence = extract_flame_evidence({})
+    assert "mean_color" not in evidence
+    assert "flame_region" not in evidence
+    assert extract_flame_evidence(None) == {}
+    assert extract_flame_evidence("not a dict") == {}
+
+
+def test_rgb_to_hsv_known_values():
+    assert rgb_to_hsv([255, 0, 0]) == {"h": 0.0, "s": 100.0, "v": 100.0}
+    assert rgb_to_hsv([0, 255, 0])["h"] == pytest.approx(120.0, abs=0.1)
+    assert rgb_to_hsv([0, 0, 255])["h"] == pytest.approx(240.0, abs=0.1)
+    grey = rgb_to_hsv([128, 128, 128])
+    assert grey["s"] == 0.0
+
+
+def test_rgb_to_hsv_rejects_bad_input():
+    assert rgb_to_hsv(None) is None
+    assert rgb_to_hsv([1, 2]) is None
+    assert rgb_to_hsv([300, 0, 0]) is None
+    assert rgb_to_hsv("red") is None
 
 
 # ---------------------------------------------------------------------------
@@ -365,8 +606,31 @@ def test_ai_material_analysis_present_when_gemini_succeeds(monkeypatch):
     assert ai["primary_material"] == "Wood Materials"
     assert len(ai["matches"]) == 5
     assert ai["overall_confidence_level"] == "medium"
+    assert ai["evidence_quality"] == "moderate"
     assert "ai_material_ms" in body["timing"]
     assert body["timing"]["ai_material_ms"] >= 0
+
+
+def test_ai_material_analysis_reports_uncertain_when_evidence_is_ambiguous(monkeypatch):
+    """The API surfaces the uncertain/null outcome; the deterministic result is untouched."""
+    monkeypatch.setattr(
+        "app.gemini_analysis._create_client",
+        lambda _s: _StubClient(_ok_handler(_uncertain_payload())),
+    )
+    with _api_client(monkeypatch) as client:
+        body = _analyzed_body(client)
+
+    from tests.test_api import SUCCESS_RESULT
+
+    ai = body["ai_material_analysis"]
+    assert ai["available"] is True
+    assert ai["primary_material"] is None
+    assert ai["uncertain"] is True
+    assert ai["overall_confidence_level"] == "low"
+    assert ai["evidence_quality"] == "insufficient"
+    assert len(ai["matches"]) == 5
+    # The deterministic analysis is never overwritten or merged.
+    assert body["material_analysis"] == SUCCESS_RESULT["material_analysis"]
 
 
 def test_api_key_is_never_exposed_in_the_response(monkeypatch):

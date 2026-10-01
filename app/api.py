@@ -39,6 +39,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .analyzer import FlameAnalyzer
 from .config import Settings
+from .flame_evidence import extract_flame_evidence
 from .errors import (
     AnalysisError,
     AnalyzerUnavailableError,
@@ -111,12 +112,12 @@ async def _attach_ai_material_analysis(request: Request, result: dict[str, Any])
     ``material_analysis`` is already complete when this runs, and *any* Gemini
     failure (disabled, missing key, quota, timeout, malformed payload) becomes
     ``ai_material_analysis: {"available": false, ...}`` rather than an error for
-    the whole request.  Only the extracted mean flame colour is forwarded - never
-    the image or the mask.
+    the whole request.  Only the flame evidence extracted from the analyzer's
+    own result is forwarded - never the image and never the mask payload.
     """
     settings = request.app.state.settings
-    mean_color = ((result.get("flame_analysis") or {}).get("mean_color")) or None
-    if not mean_color:
+    evidence = extract_flame_evidence(result)
+    if not evidence.get("mean_color"):
         result["ai_material_analysis"] = {
             "available": False,
             "error": "No flame colour evidence was extracted for the AI analysis.",
@@ -134,7 +135,7 @@ async def _attach_ai_material_analysis(request: Request, result: dict[str, Any])
     started = time.perf_counter()
     try:
         payload = await run_in_threadpool(
-            gemini_material_analysis, mean_color, settings, database
+            gemini_material_analysis, evidence, settings, database
         )
     except Exception:  # noqa: BLE001 - the AI analysis must never fail the request
         logger.exception("AI material analysis failed unexpectedly")
@@ -239,13 +240,18 @@ def create_app(
             "PNG.  The detection bounding box (`fire_detection.bbox`) and the "
             "segmentation mask (`segmentation.mask`) are separate fields: the box "
             "is a detection rectangle, the mask is the flame region.\n\n"
-            "When `GEMINI_ENABLED=1` and `GEMINI_API_KEY` are set, a secondary "
-            "`ai_material_analysis` section adds an independent Gemini opinion on "
-            "the burning material.  It receives only the extracted mean flame "
-            "RGB/LAB values and the canonical material vocabulary - never the "
-            "image - and any Gemini failure degrades to "
-            "`ai_material_analysis: {available: false}` without affecting the "
-            "deterministic result.\n\n"
+             "When `GEMINI_ENABLED=1` and `GEMINI_API_KEY` are set, a secondary "
+             "`ai_material_analysis` section adds an independent, "
+             "uncertainty-aware Gemini opinion on the burning material.  It "
+             "receives only the flame evidence extracted from the analyzer's own "
+             "result (final RGB/LAB, HSV, brightness, saturation, flame-region "
+             "statistics, detection/segmentation confidences, bounding-box "
+             "geometry and the already-calculated colour clusters) plus the "
+             "canonical material vocabulary - never the image - and any Gemini "
+             "failure degrades to `ai_material_analysis: {available: false}` "
+             "without affecting the deterministic result.  The AI analysis may "
+             "report `primary_material: null` with `uncertain: true` when the "
+             "evidence cannot reliably distinguish materials.\n\n"
             "No UI, no tunnels. Models are loaded once per worker process and "
             "reused for every request."
         ),
