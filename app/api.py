@@ -24,10 +24,12 @@ Run locally with::
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Request, UploadFile
@@ -147,6 +149,25 @@ async def _attach_ai_material_analysis(request: Request, result: dict[str, Any])
         if isinstance(timing, dict):
             timing["ai_material_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
     return result
+
+
+# ---------------------------------------------------------------------------
+# EC2 inactivity heartbeat
+# ---------------------------------------------------------------------------
+def _touch_activity_file(path: Path) -> None:
+    """Refresh the modification time of the EC2 inactivity watchdog file.
+
+    Best-effort by contract: the watchdog file lives on the instance and may
+    be unwritable (read-only mount, missing directory, permissions).  A
+    failure here is logged and swallowed so it can never break ``/analyze``
+    or any other endpoint.  A missing file is created.
+    """
+    try:
+        path.touch(exist_ok=True)
+        now = time.time()
+        os.utime(path, (now, now))
+    except OSError:
+        logger.warning("Could not update the activity file %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +356,45 @@ def create_app(
                 "device": analyzer.device,
             },
         )
+
+    @application.post(
+        "/activity",
+        tags=["meta"],
+        summary="EC2 inactivity watchdog heartbeat",
+        responses={
+            200: {
+                "description": "Heartbeat accepted; the activity file was touched.",
+                "content": {"application/json": {"example": {"status": "active"}}},
+            },
+        },
+    )
+    async def activity_post(request: Request) -> dict[str, str]:
+        """Heartbeat for the EC2 inactivity watchdog.
+
+        Touches ``settings.activity_file`` (default
+        ``/var/run/flame-analyzer-last-activity``) so the watchdog sees the
+        instance as active.  No authentication, no body, no expensive
+        processing.  The update is best-effort: even if the file cannot be
+        written the endpoint still returns 200 so a transient filesystem
+        problem never turns into a frontend-visible error.
+        """
+        _touch_activity_file(Path(request.app.state.settings.activity_file))
+        return {"status": "active"}
+
+    @application.get(
+        "/activity",
+        tags=["meta"],
+        summary="Activity endpoint test",
+        responses={
+            200: {
+                "description": "The activity endpoint is reachable.",
+                "content": {"application/json": {"example": {"status": "active"}}},
+            },
+        },
+    )
+    async def activity_get() -> dict[str, str]:
+        """Lightweight liveness check for the activity endpoint. Testing only."""
+        return {"status": "active"}
 
     @application.post(
         "/analyze",

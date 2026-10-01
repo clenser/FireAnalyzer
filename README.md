@@ -32,7 +32,7 @@ flame-analyzer/
 ├── app/
 │   ├── __init__.py           # public exports
 │   ├── analyzer.py           # FlameAnalyzer: model loading + pipeline orchestration
-│   ├── api.py                # FastAPI app: POST /analyze, GET /health, GET /
+│   ├── api.py                # FastAPI app: POST /analyze, GET /health, GET /, POST/GET /activity
 │   ├── cli.py                # command line runner (prints JSON)
 │   ├── color_analysis.py     # flame pixels -> LAB -> 5 clustering algorithms
 │   ├── config.py             # Settings: all inference parameters in one place
@@ -131,6 +131,14 @@ third-party calls.
 | `GET`  | `/`        | Service name, status, version                        |
 | `GET`  | `/health`  | `200` when the models are loaded, `503` otherwise   |
 | `POST` | `/analyze` | `multipart/form-data` with a single `image` field    |
+| `POST` | `/activity` | EC2 inactivity watchdog heartbeat (touches `/var/run/flame-analyzer-last-activity`) |
+| `GET`  | `/activity` | Same `{"status": "active"}` response, for testing    |
+
+`POST /activity` takes no body and no authentication. It updates the
+modification time of `/var/run/flame-analyzer-last-activity` (override with
+`FLAME_ACTIVITY_FILE`) and returns `200 {"status": "active"}`. The update is
+best-effort: if the file cannot be written the endpoint still returns 200, so
+a transient filesystem problem never breaks `/analyze` or the frontend.
 
 `POST /analyze`:
 

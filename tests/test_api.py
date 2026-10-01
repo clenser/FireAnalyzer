@@ -284,6 +284,56 @@ def test_analyze_is_unavailable_before_startup():
 
 
 # ---------------------------------------------------------------------------
+# POST /activity - EC2 inactivity watchdog heartbeat
+# ---------------------------------------------------------------------------
+def test_activity_post_returns_200(tmp_path):
+    with _client(StubAnalyzer(), activity_file=str(tmp_path / "activity")) as client:
+        response = client.post("/activity")
+    assert response.status_code == 200
+    assert response.json() == {"status": "active"}
+
+
+def test_activity_post_touches_the_activity_file(tmp_path):
+    activity = tmp_path / "activity"
+    activity.write_text("stale")
+    before = activity.stat().st_mtime
+    time.sleep(0.01)
+    with _client(StubAnalyzer(), activity_file=str(activity)) as client:
+        response = client.post("/activity")
+    assert response.status_code == 200
+    assert activity.stat().st_mtime > before
+
+
+def test_activity_get_returns_200():
+    with _client(StubAnalyzer()) as client:
+        response = client.get("/activity")
+    assert response.status_code == 200
+    assert response.json() == {"status": "active"}
+
+
+def test_activity_post_recreates_a_missing_file(tmp_path):
+    activity = tmp_path / "activity"
+    assert not activity.exists()
+    with _client(StubAnalyzer(), activity_file=str(activity)) as client:
+        response = client.post("/activity")
+    assert response.status_code == 200
+    assert activity.is_file()
+
+
+def test_activity_timestamp_failure_does_not_break_the_app(tmp_path):
+    # A directory in place of the file makes every write fail with OSError.
+    blocker = tmp_path / "blocker"
+    blocker.mkdir()
+    with _client(StubAnalyzer(), activity_file=str(blocker)) as client:
+        response = client.post("/activity")
+        assert response.status_code == 200
+        assert response.json() == {"status": "active"}
+        analyze = client.post("/analyze", files={"image": ("f.png", _png_bytes(), "image/png")})
+    assert analyze.status_code == 200
+    assert analyze.json()["success"] is True
+
+
+# ---------------------------------------------------------------------------
 # POST /analyze - happy path
 # ---------------------------------------------------------------------------
 def test_analyze_accepts_a_valid_image():

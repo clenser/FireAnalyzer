@@ -134,6 +134,9 @@ class Settings:
         Browser origins allowed to call the API.  Empty (the default) means CORS
         is disabled entirely, which is the right setting for a server-to-server
         deployment.  ``("*",)`` allows any origin *without* credentials.
+    activity_file:
+        Path touched by ``POST /activity`` for the EC2 inactivity watchdog.
+        Overridable with ``FLAME_ACTIVITY_FILE`` for testing.
     gemini_enabled:
         Opt in to the *secondary* Gemini material analysis (see
         :mod:`app.gemini_analysis`).  Defaults to ``False``: the deterministic
@@ -203,6 +206,9 @@ class Settings:
     # --- HTTP API ------------------------------------------------------
     max_image_mb: int = 10
     cors_origins: tuple[str, ...] = ()
+    #: File whose modification time is refreshed on every ``POST /activity``
+    #: heartbeat.  The EC2 inactivity watchdog monitors this path.
+    activity_file: str = "/var/run/flame-analyzer-last-activity"
 
     # --- Gemini (secondary AI material analysis) -------------------------
     gemini_enabled: bool = False
@@ -252,6 +258,7 @@ class Settings:
             ultralytics_verbose=_env_bool("FLAME_YOLO_VERBOSE", False),
             max_image_mb=_env_int("FLAME_MAX_IMAGE_MB", 10),
             cors_origins=_env_list("FLAME_CORS_ORIGINS"),
+            activity_file=os.environ.get("FLAME_ACTIVITY_FILE") or "/var/run/flame-analyzer-last-activity",
             gemini_enabled=_env_bool("GEMINI_ENABLED", False),
             gemini_api_key=os.environ.get("GEMINI_API_KEY") or None,
             gemini_model=os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash-lite",
