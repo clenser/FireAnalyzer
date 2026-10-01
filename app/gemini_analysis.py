@@ -97,10 +97,17 @@ Return structured JSON only."""
 
 #: Structured-output contract enforced by the SDK (``response_mime_type``+
 #: ``response_schema``) and re-validated locally after the call.
+#:
+#: Schema note: the Gemini API accepts only the restricted JSON-Schema subset
+#: documented at https://ai.google.dev/gemini-api/docs/structured-output -
+#: ``type`` must be a single type name, so a nullable field is expressed with
+#: ``"nullable": true`` rather than a union such as ``["string", "null"]``
+#: (the latter fails SDK validation with a pydantic ValidationError before
+#: any request is sent).
 RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "primary_material": {"type": ["string", "null"]},
+        "primary_material": {"type": "string", "nullable": True},
         "matches": {
             "type": "array",
             "items": {

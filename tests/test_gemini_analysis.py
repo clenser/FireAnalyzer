@@ -390,6 +390,62 @@ def test_dataset_vocabulary_is_enforced(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Regression: the real-API ValidationError (union type in response_schema)
+# ---------------------------------------------------------------------------
+def _walk_schema(node: Any):
+    """Yield every dict/list node of a JSON schema, recursively."""
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk_schema(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_schema(item)
+
+
+def test_response_schema_uses_no_union_types():
+    """A JSON-Schema union ({"type": ["string", "null"]}) is rejected by the
+    Gemini SDK before any request is sent - the exact real-API ValidationError.
+    """
+    from app.gemini_analysis import RESPONSE_SCHEMA
+
+    for node in _walk_schema(RESPONSE_SCHEMA):
+        type_value = node.get("type")
+        assert not isinstance(type_value, list), (
+            f"union type {type_value!r} is not supported by the Gemini Schema; "
+            'use a single type with "nullable": true'
+        )
+        assert "anyOf" not in node
+        assert "$ref" not in node
+        assert "$defs" not in node
+        assert "additionalProperties" not in node
+
+
+def test_response_schema_nullable_primary_uses_gemini_representation():
+    """primary_material stays nullable via the Gemini-supported representation."""
+    from app.gemini_analysis import RESPONSE_SCHEMA
+
+    primary = RESPONSE_SCHEMA["properties"]["primary_material"]
+    assert primary["type"] == "string"
+    assert primary.get("nullable") is True
+
+
+def test_response_schema_validates_against_the_gemini_sdk():
+    """The exact SDK validation that raised the real ValidationError.
+
+    ``types.Schema.model_validate`` is what the google-genai client runs on the
+    configured response_schema before sending the request; if this passes, the
+    request is not rejected client-side.  Skipped when google-genai is absent.
+    """
+    google_genai = pytest.importorskip("google.genai")
+    from app.gemini_analysis import RESPONSE_SCHEMA
+
+    validated = google_genai.types.Schema.model_validate(RESPONSE_SCHEMA)
+    assert validated.properties["primary_material"].nullable is True
+    assert validated.properties["primary_material"].type == google_genai.types.Type.STRING
+
+
+# ---------------------------------------------------------------------------
 # Prompt design: evidence-based, uncertainty-aware, never colour-alone
 # ---------------------------------------------------------------------------
 def test_prompt_carries_evidence_and_vocabulary_but_no_image(monkeypatch):
