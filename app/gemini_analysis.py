@@ -48,12 +48,15 @@ from .material_matching import MaterialDatabase, load_material_database
 
 __all__ = [
     "SYSTEM_INSTRUCTION",
+    "VIDEO_SYSTEM_INSTRUCTION",
+    "VIDEO_CONSOLIDATION_INSTRUCTION",
     "REQUIRED_CANDIDATES",
     "EVIDENCE_QUALITY_LEVELS",
     "CONFIDENCE_LEVELS",
     "GeminiMatch",
     "GeminiTimeoutError",
     "gemini_material_analysis",
+    "gemini_video_material_analysis",
 ]
 
 logger = logging.getLogger(__name__)
@@ -73,7 +76,12 @@ EVIDENCE_QUALITY_LEVELS = ("insufficient", "limited", "moderate", "strong")
 #: evaluation (not colour matching), fixes the vocabulary rule, authorises the
 #: uncertain/null outcome and the "heuristic, not probabilities" meaning of the
 #: percentage values.
-SYSTEM_INSTRUCTION = """You are performing secondary material analysis for a flame-analysis system.
+#:
+#: :data:`_EVIDENCE_INSTRUCTION` holds the rules that apply to every request - a
+#: single image and a whole video alike - and each caller appends what is specific
+#: to it.  The single-image assembly below is byte-for-byte the instruction the
+#: image workflow has always used.
+_EVIDENCE_INSTRUCTION = """You are performing secondary material analysis for a flame-analysis system.
 
 The supplied measurements describe the observed flame, not necessarily the fuel itself.
 
@@ -91,7 +99,22 @@ Do not fabricate evidence that is not supplied.
 
 Do not assume that the visually closest material is the actual burning material.
 
-A flame's color is weak evidence for material identity: different fuels can produce overlapping flame colors, and camera exposure, white balance and the background environment affect the measured values.
+A flame's color is weak evidence for material identity: different fuels can produce overlapping flame colors, and camera exposure, white balance and the background environment affect the measured values."""
+
+SYSTEM_INSTRUCTION = f"""{_EVIDENCE_INSTRUCTION}
+
+Return structured JSON only."""
+
+#: The one rule that makes a video assessment different from an image assessment:
+#: the frames are samples of a single event, not independent classifications to be
+#: scored and averaged.
+VIDEO_CONSOLIDATION_INSTRUCTION = """The supplied observations are multiple samples of the same fire event. Evaluate the complete collection jointly and return ONE consolidated material assessment for the video. Do not independently classify each frame and average confidence percentages. Confidence must reflect the consistency, quality, and amount of evidence across the complete set of observations."""
+
+VIDEO_SYSTEM_INSTRUCTION = f"""{_EVIDENCE_INSTRUCTION}
+
+{VIDEO_CONSOLIDATION_INSTRUCTION}
+
+Return exactly one consolidated assessment for the video. Never return one assessment per observation, and never derive it by averaging per-observation confidences.
 
 Return structured JSON only."""
 
@@ -177,15 +200,25 @@ def _create_client(settings: Settings):
     return genai.Client(api_key=settings.gemini_api_key)
 
 
-def _generate(client: Any, settings: Settings, contents: str) -> Any:
-    """One structured-output content generation call."""
+def _generate(
+    client: Any,
+    settings: Settings,
+    contents: str,
+    system_instruction: str = SYSTEM_INSTRUCTION,
+) -> Any:
+    """One structured-output content generation call.
+
+    ``system_instruction`` defaults to the single-image instruction, so the image
+    workflow's Gemini configuration is unchanged; the video workflow passes
+    :data:`VIDEO_SYSTEM_INSTRUCTION`.
+    """
     from google.genai import types
 
     return client.models.generate_content(
         model=settings.gemini_model,
         contents=contents,
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=system_instruction,
             response_mime_type="application/json",
             response_schema=RESPONSE_SCHEMA,
             # HttpOptions.timeout is in milliseconds.
@@ -240,6 +273,20 @@ def _format_clusters(clusters: Any) -> list[str]:
         share = cluster.get("pixel_share")
         share_text = f"{100.0 * float(share):.1f}% of samples" if isinstance(share, (int, float)) else "share unknown"
         lines.append(f"RGB {_format_color_list(cluster.get('rgb'))} ({share_text})")
+    return lines
+
+
+def _vocabulary_lines(database: MaterialDatabase) -> list[str]:
+    """The canonical material vocabulary and its dataset notes.
+
+    Shared by the image and video prompts so both offer Gemini exactly the same
+    closed vocabulary from the same ``flame_dataset.json``.
+    """
+    lines = ["", f"Canonical material vocabulary ({len(database)} categories):"]
+    lines.extend(f"{index}. {entry.name}" for index, entry in enumerate(database.entries, 1))
+    lines.append("")
+    lines.append("Dataset descriptions/notes for each canonical material:")
+    lines.extend(f"- {entry.name}: {entry.notes or '(no notes)'}" for entry in database.entries)
     return lines
 
 
@@ -319,18 +366,7 @@ def _build_user_content(evidence: dict[str, Any], database: MaterialDatabase) ->
     elif distribution.get("skipped_reason"):
         lines.append(f"- Colour distribution: not calculated ({distribution['skipped_reason']})")
 
-    lines.extend(
-        [
-            "",
-            f"Canonical material vocabulary ({len(database)} categories):",
-        ]
-    )
-    lines.extend(f"{index}. {entry.name}" for index, entry in enumerate(database.entries, 1))
-    lines.append("")
-    lines.append("Dataset descriptions/notes for each canonical material:")
-    lines.extend(
-        f"- {entry.name}: {entry.notes or '(no notes)'}" for entry in database.entries
-    )
+    lines.extend(_vocabulary_lines(database))
     lines.extend(
         [
             "",
@@ -345,6 +381,121 @@ def _build_user_content(evidence: dict[str, Any], database: MaterialDatabase) ->
             "\"insufficient\" (or \"limited\" if some weak signal exists).",
             "- confidence_percent expresses how strongly the evidence supports each candidate, not "
             "color closeness; it is a heuristic score, not a calibrated probability.",
+            f"- Return exactly {REQUIRED_CANDIDATES} ranked candidates, copying every material name "
+            "verbatim from the canonical vocabulary above.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_frame_evidence(frame: dict[str, Any]) -> str:
+    """One line per frame: its measured colour and whatever else was supplied."""
+    mean_color = frame.get("mean_color") or {}
+    position = f"frame {frame.get('frame_index')}"
+    if frame.get("timestamp_seconds") is not None:
+        position += f" at t={frame['timestamp_seconds']}s"
+
+    bits = [f"- {position}: RGB {_format_color_list(mean_color.get('rgb'))}"]
+    bits.append(f"LAB {_format_color_list(mean_color.get('lab'))}")
+    hsv = frame.get("hsv")
+    if isinstance(hsv, dict):
+        bits.append(f"HSV H={hsv.get('h')} deg S={hsv.get('s')}% V={hsv.get('v')}%")
+    if frame.get("brightness_0_255") is not None:
+        bits.append(f"brightness {frame['brightness_0_255']} (0-255)")
+    if frame.get("saturation_0_100") is not None:
+        bits.append(f"saturation {frame['saturation_0_100']}%")
+    if frame.get("detection_confidence") is not None:
+        bits.append(f"detection confidence {frame['detection_confidence']}")
+    if frame.get("segmentation_confidence") is not None:
+        bits.append(f"segmentation confidence {frame['segmentation_confidence']}")
+    region = frame.get("flame_region") or {}
+    if region.get("mask_area_ratio") is not None:
+        bits.append(f"flame area {100.0 * float(region['mask_area_ratio']):.2f}% of the frame")
+    return ", ".join(bits)
+
+
+def _format_collection_summary(collection: dict[str, Any]) -> list[str]:
+    """Whole-collection statistics: consistency and amount of evidence."""
+    lines: list[str] = []
+    lines.append(
+        f"- Observations analysed: {collection.get('frame_count')} frames of one fire event"
+    )
+    if collection.get("time_span_seconds") is not None:
+        lines.append(f"- Observed time span: {collection['time_span_seconds']}s")
+    lines.append(f"- Mean RGB across the frames: {_format_color_list(collection.get('mean_rgb'))}")
+    lines.append(f"- Mean LAB across the frames: {_format_color_list(collection.get('mean_lab'))}")
+    lines.append(
+        f"- Per-channel LAB standard deviation across the frames "
+        f"(0 means every frame measured the same colour): "
+        f"{_format_color_list(collection.get('lab_std_dev'))}"
+    )
+    if collection.get("mean_detection_confidence") is not None:
+        lines.append(
+            f"- Mean fire detection confidence across the frames: "
+            f"{collection['mean_detection_confidence']}"
+        )
+    if collection.get("mean_segmentation_confidence") is not None:
+        lines.append(
+            f"- Mean flame segmentation confidence across the frames: "
+            f"{collection['mean_segmentation_confidence']}"
+        )
+    if collection.get("mean_flame_area_ratio") is not None:
+        lines.append(
+            f"- Mean flame area across the frames: "
+            f"{100.0 * float(collection['mean_flame_area_ratio']):.2f}% of the frame"
+        )
+    return lines
+
+
+def _build_video_user_content(evidence: dict[str, Any], database: MaterialDatabase) -> str:
+    """The user message for a whole video: every frame's evidence, plus the rules.
+
+    ``evidence`` is the collection built by
+    :func:`app.video_material.build_video_evidence`.  Every analysed frame appears
+    individually, and the cross-frame statistics are supplied alongside so the
+    model can judge consistency - the consolidation
+    :data:`VIDEO_CONSOLIDATION_INSTRUCTION` demands.  Only numbers are sent: no
+    image, no mask, no base64, not even a filename.
+    """
+    frames = evidence.get("frames") or []
+    collection = evidence.get("collection") or {}
+
+    lines = [
+        f"Structured flame evidence for one video: {evidence.get('frame_count', len(frames))} "
+        "frames sampled from a single fire event.",
+        "These are numerical measurements of the flame, not the fuel, and no images are supplied.",
+        "",
+        "Per-frame observations:",
+    ]
+    lines.extend(_format_frame_evidence(frame) for frame in frames)
+
+    lines.append("")
+    lines.append("Whole-collection statistics (measured across all frames, not a per-frame verdict):")
+    lines.extend(_format_collection_summary(collection))
+
+    lines.extend(_vocabulary_lines(database))
+    lines.extend(
+        [
+            "",
+            VIDEO_CONSOLIDATION_INSTRUCTION,
+            "",
+            "Instructions:",
+            "- Evaluate the complete collection of frames jointly as one fire event.",
+            "- Do not classify the frames independently and do not average their confidence "
+            "percentages; return ONE consolidated material assessment for the video.",
+            "- Let the consistency of the observations across the frames, the amount of evidence "
+            "and the measurement confidences drive the reported confidence and "
+            "evidence_quality.",
+            "- Flame color is weak evidence for material identity; do not select a material merely "
+            "because its documented flame color is closest to the measurements.",
+            "- If several materials remain plausible, return them as ranked candidates with low or "
+            "medium confidence and set uncertain to true.",
+            "- If the observations cannot reliably distinguish materials, set primary_material to "
+            "null, uncertain to true, overall_confidence_level to \"low\" and evidence_quality to "
+            "\"insufficient\" (or \"limited\" if some weak signal exists).",
+            "- confidence_percent expresses how strongly the complete set of observations supports "
+            "each candidate, not color closeness; it is a heuristic score, not a calibrated "
+            "probability.",
             f"- Return exactly {REQUIRED_CANDIDATES} ranked candidates, copying every material name "
             "verbatim from the canonical vocabulary above.",
         ]
@@ -440,7 +591,98 @@ def _validate_payload(
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Shared request/response plumbing
+# ---------------------------------------------------------------------------
+def _prepare_database(
+    settings: Settings, database: MaterialDatabase | None
+) -> tuple[MaterialDatabase | None, dict[str, Any] | None]:
+    """Apply the guard clauses shared by both Gemini entry points.
+
+    Returns ``(database, failure)``: exactly one of the two is ``None``.  The
+    checks run in the same order for images and videos - disabled, then missing
+    key, then database - so both entry points fail the same way for the same
+    reason.
+    """
+    if not settings.gemini_enabled:
+        return None, _unavailable(
+            "Gemini material analysis is disabled (GEMINI_ENABLED is not enabled)."
+        )
+    if not settings.gemini_api_key:
+        return None, _unavailable("GEMINI_API_KEY is not configured.")
+
+    try:
+        return (database if database is not None else load_material_database(settings.dataset_path), None)
+    except MissingDatabaseError as exc:
+        return None, _unavailable(f"The material database could not be loaded: {exc}")
+
+
+def _expected_candidates(db: MaterialDatabase) -> tuple[set[str], int, dict[str, Any] | None]:
+    """The canonical vocabulary and the number of candidates to expect from it."""
+    canonical = {entry.name for entry in db.entries}
+    expected = min(REQUIRED_CANDIDATES, len(canonical))
+    if expected == 0:
+        return canonical, expected, _unavailable("The material database contains no materials.")
+    return canonical, expected, None
+
+
+def _call_gemini(
+    contents: str, settings: Settings, system_instruction: str
+) -> tuple[Any | None, dict[str, Any] | None]:
+    """Perform **one** structured Gemini request.
+
+    Returns ``(response, failure)``: exactly one of the two is ``None``.  Every
+    transport failure (timeout, quota, auth, network, SDK) becomes a clean
+    unavailable payload rather than an exception.
+    """
+    try:
+        response = _run_with_timeout(
+            lambda: _generate(_create_client(settings), settings, contents, system_instruction),
+            settings.gemini_timeout_s,
+        )
+    except GeminiTimeoutError:
+        logger.warning("Gemini request timed out after %ss", settings.gemini_timeout_s)
+        return None, _unavailable(
+            f"The Gemini request timed out after {settings.gemini_timeout_s:g}s."
+        )
+    except Exception as exc:  # noqa: BLE001 - quota, auth, network, SDK errors: all become unavailable
+        logger.warning("Gemini request failed: %s: %s", type(exc).__name__, exc)
+        return None, _unavailable(f"The Gemini API request failed ({type(exc).__name__}).")
+    return response, None
+
+
+def _validated_result(response: Any, canonical: set[str], expected: int) -> dict[str, Any]:
+    """Validate Gemini's answer and build the canonical result.
+
+    Identical for images and videos: the structured contract, the canonical
+    vocabulary, the rank sequence, the confidence range and the uncertainty
+    consistency rules are the same, so the same result shape comes back either
+    way.  Nothing is averaged, selected or adjusted here - Gemini's own
+    confidence is passed through unchanged.
+    """
+    try:
+        payload = json.loads(getattr(response, "text", None) or "")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        logger.warning("Gemini response was not valid JSON")
+        return _unavailable("The Gemini response was not valid JSON.")
+
+    matches, error, _primary_is_null = _validate_payload(payload, canonical, expected)
+    if error is not None:
+        logger.warning("Gemini response failed validation: %s", error)
+        return _unavailable(f"The Gemini response failed validation: {error}.")
+
+    return {
+        "available": True,
+        "primary_material": payload["primary_material"],
+        "matches": [match.to_dict() for match in matches],
+        "overall_confidence_level": payload["overall_confidence_level"],
+        "uncertain": payload["uncertain"],
+        "evidence_quality": payload["evidence_quality"],
+        "reasoning_summary": payload["reasoning_summary"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public entry point - single image
 # ---------------------------------------------------------------------------
 def gemini_material_analysis(
     evidence: dict[str, Any],
@@ -473,55 +715,91 @@ def gemini_material_analysis(
         never raises: the deterministic analysis must survive any Gemini
         failure.
     """
-    if not settings.gemini_enabled:
-        return _unavailable("Gemini material analysis is disabled (GEMINI_ENABLED is not enabled).")
-    if not settings.gemini_api_key:
-        return _unavailable("GEMINI_API_KEY is not configured.")
+    db, failure = _prepare_database(settings, database)
+    if failure is not None:
+        return failure
 
-    try:
-        db = database if database is not None else load_material_database(settings.dataset_path)
-    except MissingDatabaseError as exc:
-        return _unavailable(f"The material database could not be loaded: {exc}")
-
-    canonical = {entry.name for entry in db.entries}
-    expected = min(REQUIRED_CANDIDATES, len(canonical))
-    if expected == 0:
-        return _unavailable("The material database contains no materials.")
+    canonical, expected, failure = _expected_candidates(db)
+    if failure is not None:
+        return failure
 
     if not isinstance(evidence, dict) or not evidence.get("mean_color"):
         return _unavailable("No flame colour evidence was extracted for the AI analysis.")
 
     contents = _build_user_content(evidence, db)
+    response, failure = _call_gemini(contents, settings, SYSTEM_INSTRUCTION)
+    if failure is not None:
+        return failure
 
-    def request() -> Any:
-        return _generate(_create_client(settings), settings, contents)
+    return _validated_result(response, canonical, expected)
 
-    try:
-        response = _run_with_timeout(request, settings.gemini_timeout_s)
-    except GeminiTimeoutError:
-        logger.warning("Gemini request timed out after %ss", settings.gemini_timeout_s)
-        return _unavailable(f"The Gemini request timed out after {settings.gemini_timeout_s:g}s.")
-    except Exception as exc:  # noqa: BLE001 - quota, auth, network, SDK errors: all become unavailable
-        logger.warning("Gemini request failed: %s: %s", type(exc).__name__, exc)
-        return _unavailable(f"The Gemini API request failed ({type(exc).__name__}).")
 
-    try:
-        payload = json.loads(getattr(response, "text", None) or "")
-    except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning("Gemini response was not valid JSON")
-        return _unavailable("The Gemini response was not valid JSON.")
+# ---------------------------------------------------------------------------
+# Public entry point - whole video, one consolidated result
+# ---------------------------------------------------------------------------
+def gemini_video_material_analysis(
+    evidence: dict[str, Any],
+    settings: Settings,
+    database: MaterialDatabase | None = None,
+) -> dict[str, Any]:
+    """Run **one** Gemini request over a whole collection of frame observations.
 
-    matches, error, _primary_is_null = _validate_payload(payload, canonical, expected)
-    if error is not None:
-        logger.warning("Gemini response failed validation: %s", error)
-        return _unavailable(f"The Gemini response failed validation: {error}.")
+    The supplied evidence is the collection built by
+    :func:`app.video_material.build_video_evidence`: every analysed frame with its
+    measured RGB/LAB, HSV, brightness, saturation, detection/segmentation
+    confidence and flame-area ratio, plus the cross-frame statistics.
 
-    return {
-        "available": True,
-        "primary_material": payload["primary_material"],
-        "matches": [match.to_dict() for match in matches],
-        "overall_confidence_level": payload["overall_confidence_level"],
-        "uncertain": payload["uncertain"],
-        "evidence_quality": payload["evidence_quality"],
-        "reasoning_summary": payload["reasoning_summary"],
-    }
+    What this function guarantees:
+
+    * **Exactly one** ``generate_content`` call for the entire collection, and
+      exactly one consolidated result.  It never calls Gemini per frame, never
+      averages per-frame confidences or classifications, and never picks the
+      first or the highest-confidence frame's answer - those are all
+      per-frame strategies this entry point exists to replace.
+    * The prompt carries :data:`VIDEO_CONSOLIDATION_INSTRUCTION`, so the model is
+      told to judge the collection jointly and to let consistency, quality and
+      amount of evidence drive the confidence.
+    * **No images, masks or base64** are sent, and the frames are not re-encoded
+      or re-measured here; only the supplied numbers are rendered into the prompt.
+    * Gemini's ``confidence_percent`` is returned unchanged, including values
+      below any client display threshold.
+
+    Parameters
+    ----------
+    evidence:
+        The whole-collection evidence payload (see
+        :func:`app.video_material.build_video_evidence`).
+    settings:
+        Active configuration (``gemini_enabled``, ``gemini_api_key``,
+        ``gemini_model``, ``gemini_timeout_s``) - the same Gemini configuration
+        the image workflow uses.
+    database:
+        The loaded material database.  Loaded from ``settings.dataset_path``
+        when not supplied.
+
+    Returns
+    -------
+    dict
+        The same structure :func:`gemini_material_analysis` returns: one
+        consolidated ``{"available": True, ...}`` result, or
+        ``{"available": False, "error": "..."}``.  Never raises.
+    """
+    db, failure = _prepare_database(settings, database)
+    if failure is not None:
+        return failure
+
+    canonical, expected, failure = _expected_candidates(db)
+    if failure is not None:
+        return failure
+
+    frames = evidence.get("frames") if isinstance(evidence, dict) else None
+    if not isinstance(frames, list) or not frames:
+        return _unavailable("No flame colour evidence was supplied for the AI analysis.")
+
+    contents = _build_video_user_content(evidence, db)
+    # One request for the whole collection.  See the module docstring.
+    response, failure = _call_gemini(contents, settings, VIDEO_SYSTEM_INSTRUCTION)
+    if failure is not None:
+        return failure
+
+    return _validated_result(response, canonical, expected)

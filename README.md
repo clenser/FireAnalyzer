@@ -15,6 +15,14 @@ RGB/LAB values and the canonical material vocabulary - never the image - and
 any Gemini failure degrades to `{"available": false}` without affecting the
 deterministic result. See [AI Material Analysis](#ai-material-analysis-secondary-gemini-powered).
 
+A **video** is supported by the same building blocks through two further
+endpoints, with no second classifier and no duplicated vocabulary:
+`POST /material-identification` re-runs the deterministic matcher on the
+aggregated flame colour the client measured across its frames, and
+`POST /video-material-analysis` sends every frame's evidence to Gemini in
+**one** request that returns **one** consolidated, video-level assessment. See
+[Video material analysis](#video-material-analysis-one-consolidated-assessment-per-video).
+
 ```
 HTTP request                                     CLI
     |                                               |
@@ -32,19 +40,21 @@ flame-analyzer/
 ├── app/
 │   ├── __init__.py           # public exports
 │   ├── analyzer.py           # FlameAnalyzer: model loading + pipeline orchestration
-│   ├── api.py                # FastAPI app: POST /analyze, GET /health, GET /, POST/GET /activity
+│   ├── api.py                # FastAPI app: POST /analyze, POST /material-identification, POST /video-material-analysis, GET /health, GET /, POST/GET /activity
 │   ├── cli.py                # command line runner (prints JSON)
 │   ├── color_analysis.py     # flame pixels -> LAB -> 5 clustering algorithms
 │   ├── config.py             # Settings: all inference parameters in one place
 │   ├── detection.py          # OBJ_best.pt fire detection
 │   ├── errors.py             # AnalysisError hierarchy + error codes
 │   ├── fire_classes.py       # material -> fire class + extinguishing agents
+│   ├── flame_evidence.py     # measured flame evidence shared by the image + video prompts
 │   ├── gemini_analysis.py    # secondary Gemini material analysis (optional, additive)
 │   ├── imaging.py            # image validation / bytes -> BGR decoding
 │   ├── mask.py               # mask -> base64 PNG codec (MASK_ENCODING)
 │   ├── material_matching.py  # LAB matching against flame_dataset.json
 │   ├── schemas.py            # response dataclasses + JSON-safe conversion
 │   ├── segmentation.py       # SEG_best.pt flame segmentation + bbox fallback
+│   ├── video_material.py     # video evidence aggregation + the two video endpoints
 │   └── visualization.py      # optional debug renderers (never called by the API)
 ├── models/
 │   ├── OBJ_best.pt           # custom fire detection model (do not replace)
@@ -56,7 +66,9 @@ flame-analyzer/
 ├── tests/
 │   ├── test_pipeline.py      # pipeline tests + real-weight integration test
 │   ├── test_api.py           # FastAPI TestClient tests (stubbed analyzer)
-│   └── test_gemini_analysis.py  # secondary AI analysis tests (mocked Gemini client)
+│   ├── test_gemini_analysis.py  # secondary AI analysis tests (mocked Gemini client)
+│   ├── test_material_identification.py  # deterministic video material endpoint tests
+│   └── test_video_analysis.py          # consolidated video AI endpoint tests
 ├── main.py                   # CLI entry point
 ├── test_pipeline.py          # same CLI, kept as the standalone smoke-test script
 ├── requirements.txt
@@ -81,8 +93,9 @@ python main.py fire_1.jpg
 python test_pipeline.py fire_1.jpg --pretty --verbose
 ```
 
-Run the test suite (129 tests: pipeline, API, CLI, Gemini analysis with a
-mocked client, plus a real-weight integration test that is skipped when the
+Run the test suite (295 tests: pipeline, API, CLI, Gemini analysis with a
+mocked client, the deterministic video endpoint, the consolidated video AI
+endpoint, plus a real-weight integration test that is skipped when the
 `.pt` files are absent):
 
 ```bash
@@ -131,6 +144,8 @@ third-party calls.
 | `GET`  | `/`        | Service name, status, version                        |
 | `GET`  | `/health`  | `200` when the models are loaded, `503` otherwise   |
 | `POST` | `/analyze` | `multipart/form-data` with a single `image` field    |
+| `POST` | `/material-identification` | Deterministic material match for one aggregated flame colour (JSON body) |
+| `POST` | `/video-material-analysis` | **One** Gemini request over all frame evidence → **one** consolidated assessment (JSON body) |
 | `POST` | `/activity` | EC2 inactivity watchdog heartbeat (touches `/var/run/flame-analyzer-last-activity`) |
 | `GET`  | `/activity` | Same `{"status": "active"}` response, for testing    |
 
@@ -419,6 +434,145 @@ extinguishing agents or the deterministic `material_analysis`.
 The CLI is unaffected: it prints the deterministic `FlameAnalyzer` payload;
 the AI analysis is attached by the API layer.
 
+## Video material analysis (one consolidated assessment per video)
+
+A video frontend analyses a handful of sampled frames with `POST /analyze` and
+collects the measured evidence itself. Two endpoints consume that evidence.
+Both reuse the existing pieces only - `app/material_matching.match_material`,
+the canonical `data/flame_dataset.json`, `app/fire_classes.py` and the Gemini
+client boundary - so there is **no second classifier, no duplicated material
+vocabulary and no new dataset**.
+
+### `POST /material-identification` (deterministic)
+
+The client aggregates its frames into one flame colour and sends it:
+
+```json
+{"rgb": [255, 221, 98], "lab": [89.09, -0.36, 63.31]}
+```
+
+That colour goes straight into the **same** `match_material()` used by
+`/analyze`, against the **same** dataset, and the ranked match, alternatives,
+fire class and extinguishing agents come back in the structure `/analyze`
+returns. There is no Gemini call, and **no YOLO detection or segmentation
+runs here** - the client already has the evidence. (The example below is the
+real response to that exact body; long fields are abbreviated.)
+
+```json
+{
+  "success": true,
+  "material_analysis": {
+    "primary_material": "Natural Fibers",
+    "similarity": 0.921,
+    "alternatives": [
+      {"material": "Paper Products(Wood material)", "similarity": 0.9151},
+      {"material": "Wax Materials", "similarity": 0.9151},
+      {"material": "Organic Waste", "similarity": 0.8956}
+    ],
+    "database_notes": "Yellow flame, cotton burns fast, wool self-extinguishes, ...",
+    "score_basis": "mean LAB distance to flame_dataset.json reference colours"
+  },
+  "primary_material": "Natural Fibers",
+  "similarity": 0.921,
+  "alternatives": [{"material": "Paper Products(Wood material)", "similarity": 0.9151}],
+  "suppression_information": {"source": "flame_dataset.json", "material": "Natural Fibers",
+                              "methods": ["Water", "CO2", "Foam"], "database_notes": "..."},
+  "fire_class": {"class": "Class A", "description": "Ordinary combustibles",
+                 "confidence": 0.921, "material": "Natural Fibers",
+                 "basis": "material 'Natural Fibers' -> Class A via app/fire_classes.py",
+                 "mapping_source": "app/fire_classes.py", "notes": "..."},
+  "extinguishing_agents": [
+    {"name": "Water", "compound": null, "type": "cooling",
+     "source": "flame_dataset.json", "fire_class": "Class A", "compound_basis": "..."},
+    {"name": "CO2", "compound": null, "type": "oxygen_displacement",
+     "source": "flame_dataset.json", "fire_class": "Class A", "compound_basis": "..."},
+    {"name": "Foam", "compound": null, "type": "blanketing",
+     "source": "flame_dataset.json", "fire_class": "Class A", "compound_basis": "..."}
+  ]
+}
+```
+
+`primary_material`, `similarity` and `alternatives` are mirrors of the nested
+`material_analysis` fields, following the project's existing alias convention
+(`bbox` mirrors `bounding_box`). **The video fire class comes from this
+deterministic match, never from Gemini** - that is what makes it trustworthy.
+
+### `POST /video-material-analysis` (one Gemini request, one result)
+
+The client sends the whole frame collection:
+
+```json
+{
+  "frames": [
+    {"frame_index": 0, "timestamp_seconds": 0.0,  "rgb": [255, 180, 60], "lab": [70.0, 25.0, 60.0],
+     "detection_confidence": 0.91, "segmentation_confidence": 0.95, "flame_area_ratio": 0.18},
+    {"frame_index": 1, "timestamp_seconds": 4.2,  "rgb": [166, 80, 27],  "lab": [43.8, 31.4, 43.0],
+     "detection_confidence": 0.78, "segmentation_confidence": 0.91, "flame_area_ratio": 0.14}
+  ]
+}
+```
+
+Only `frame_index`, `rgb` and `lab` are required; the other measurements are
+omitted rather than invented when absent. A video costs one Gemini call per
+frame the client analysed with `/analyze`, plus **one** here for the entire
+frame collection - never one per frame of this endpoint.
+
+- **ONE request, ONE answer.** All frame evidence - plus collection-level mean
+  RGB/LAB, per-channel LAB standard deviation, mean flame area, mean confidences
+  and the observed time span - is assembled into a single text prompt. Gemini is
+  **never** called per frame, per-frame answers are **never** averaged, and
+  neither the first nor the highest-confidence frame's verdict is selected. The
+  model is instructed to judge the collection as one fire event and to let the
+  consistency, quality and amount of evidence across all frames drive its
+  confidence. A list of per-frame assessments is rejected as malformed.
+- **Numbers only.** `extra="forbid"` on the request bodies rejects any unknown
+  field, so `image_base64`, `mask` or `filename` is a clean `422` rather than a
+  silently dropped multi-megabyte payload. No image, mask or base64 ever reaches
+  the prompt.
+- **The same validation contract as the image path.** The result must name
+  canonical dataset materials only, use ranks 1-5, return exactly 5 candidates
+  with `confidence_percent` in `[0, 100]`, and set `primary_material` consistently
+  with `uncertain`. Failures degrade to `{"available": false, "error": ...}`.
+- **Confidence is never inflated.** `display_threshold_percent` (`45.0`) is the
+  frontend AI-card visibility rule and is reported with the result so it lives in
+  one place. It is **never** applied to the value: a `12.0` comes back as `12.0`.
+
+```json
+{
+  "available": true,
+  "primary_material": "Natural Fibers",
+  "matches": [
+    {"rank": 1, "material": "Natural Fibers", "confidence_percent": 72.0,
+     "reason": "Consistent yellow-orange colour across all frames supports an organic fuel."},
+    {"rank": 2, "material": "Paper Products(Wood material)", "confidence_percent": 64.0,
+     "reason": "Also plausible; the frames do not separate paper from fibre."}
+  ],
+  "overall_confidence_level": "medium",
+  "uncertain": false,
+  "evidence_quality": "moderate",
+  "reasoning_summary": "All sampled frames of this video show the same yellow-orange flame ...",
+  "frames_supplied": 4,
+  "frames_analyzed": 4,
+  "display_threshold_percent": 45.0
+}
+```
+
+`frames_supplied` vs. `frames_analyzed` reports how many frames carried usable
+colour evidence. The response is Gemini-only: it carries no per-frame verdicts
+and no fire class - the video fire class is the deterministic
+`/material-identification` answer.
+
+| Status | Code                | Meaning                                                       |
+| ------ | ------------------- | ------------------------------------------------------------- |
+| `200`  | –                   | analysed, **or** `available: false` when Gemini was unusable   |
+| `422`  | `VALIDATION_ERROR`  | malformed body, out-of-range value, or an unknown field        |
+
+Gemini failures are **not** HTTP errors. Disabled (`GEMINI_ENABLED=0`), a
+missing `GEMINI_API_KEY`, exhausted quota, a timeout (`GEMINI_TIMEOUT_S`,
+default 30 s), a missing `flame_dataset.json` or a payload that fails validation
+all return `200` with `available: false` and a short `error` string - no
+stack trace, no key, and the deterministic result is untouched.
+
 ### Reference UI
 
 `frontend/index.html` is a minimal standalone page (no build step). Serve it
@@ -472,6 +626,13 @@ variables:
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | model used for the secondary analysis |
 | `GEMINI_TIMEOUT_S` | `30` | hard timeout for one Gemini request |
 
+Both video endpoints reuse these settings unchanged: the deterministic one needs
+only `FLAME_DATASET`, `FLAME_SIM_SCALE` and `FLAME_MAX_ALTERNATIVES`, and the
+video AI one uses the same `GEMINI_*` variables as `/analyze`. No video-specific
+environment variable was added; `MAX_VIDEO_FRAMES` and
+`VIDEO_DISPLAY_THRESHOLD_PERCENT` are fixed constants in
+`app/video_material.py`.
+
 ### Parameters that differ from the original script
 
 The clustering algorithms, their hyper-parameters and the k-selection procedure
@@ -524,6 +685,15 @@ Two settings are **new**, not restorations:
   are heuristic scores, not calibrated probabilities, and any Gemini failure
   degrades to `ai_material_analysis: {available: false}` without affecting the
   deterministic result.
+* **Video material analysis** (`app/video_material.py`) adds no new classifier.
+  The deterministic half re-runs `match_material()` on the client's aggregated
+  colour, so the video fire class and agents come from the same documented
+  mapping as an image. The AI half builds **one** prompt from all frame evidence
+  (mean colours, LAB spread, mean confidences, time span) and takes **one**
+  consolidated answer - never per-frame calls, never an average of per-frame
+  verdicts, never the first or highest-confidence frame. Frame counts up to
+  `MAX_VIDEO_FRAMES` (120) and unknown request fields, including any image or
+  base64 field, are rejected before Gemini is ever contacted.
 * **Suppression data** - copied verbatim from `flame_dataset.json`; nothing is
   generated or invented. Agents are reported as dataset names with a mechanism
   category, and `compound` stays `null` because the dataset has no chemical

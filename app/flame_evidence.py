@@ -32,7 +32,7 @@ import math
 from collections.abc import Sequence
 from typing import Any
 
-__all__ = ["extract_flame_evidence", "rgb_to_hsv"]
+__all__ = ["extract_flame_evidence", "rgb_to_hsv", "perceived_brightness"]
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,17 @@ def _brightness(rgb: Sequence[float] | None) -> float | None:
     except (TypeError, ValueError):
         return None
     return round(_LUMA_WEIGHTS[0] * r + _LUMA_WEIGHTS[1] * g + _LUMA_WEIGHTS[2] * b, 1)
+
+
+def perceived_brightness(rgb: Sequence[float] | None) -> float | None:
+    """Public form of the internal brightness helper, used for frame evidence too.
+
+    The image path derives brightness inside :func:`extract_flame_evidence`; the
+    video path derives it per frame from a colour the client measured.  Both use
+    this one implementation, so a frame's brightness is computed exactly the way
+    an image's is.
+    """
+    return _brightness(rgb)
 
 
 def _number(value: Any) -> float | None:

@@ -16,6 +16,17 @@ analysis, and mapping the existing error codes onto HTTP statuses::
 
 No detection, segmentation, clustering or material-matching logic lives here.
 
+The two video endpoints are transport layers over
+:mod:`app.video_material`:
+
+* ``POST /material-identification`` runs the *existing* deterministic matcher
+  against an aggregated flame colour the client measured itself.  No detection
+  and no segmentation are involved, and no Gemini call is made - this is the
+  source of truth for the video fire class.
+* ``POST /video-material-analysis`` sends every supplied frame's structured
+  evidence to Gemini in **one** request and returns **one** consolidated
+  video-level material assessment.
+
 Run locally with::
 
     uvicorn app.api:app --host 0.0.0.0 --port 8000
@@ -58,7 +69,13 @@ from .errors import (
 )
 from .gemini_analysis import gemini_material_analysis
 from .imaging import decode_image_bytes
-from .material_matching import load_material_database
+from .material_matching import MaterialDatabase, load_material_database
+from .video_material import (
+    MaterialIdentificationRequest,
+    VideoMaterialAnalysisRequest,
+    identify_material,
+    video_material_analysis,
+)
 
 __all__ = ["app", "create_app", "SERVICE_NAME", "ERROR_STATUS"]
 
@@ -171,6 +188,28 @@ def _touch_activity_file(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Material database access (no models required)
+# ---------------------------------------------------------------------------
+def _material_database(request: Request) -> MaterialDatabase:
+    """The canonical material database, with or without a loaded analyzer.
+
+    The deterministic matcher only needs ``flame_dataset.json``, so
+    ``/material-identification`` works without any YOLO model loaded.  The
+    analyzer's in-memory copy is preferred - it is the one ``/analyze`` matched
+    against - and the same file is loaded directly when no analyzer is attached
+    yet.  Raises :class:`~app.errors.MissingDatabaseError` (mapped to 503) when
+    the dataset itself is unavailable.
+    """
+    analyzer = getattr(request.app.state, "analyzer", None)
+    if analyzer is not None:
+        try:
+            return analyzer.database
+        except Exception:  # noqa: BLE001 - an analyzer without a database simply has none
+            logger.info("Analyzer exposes no material database; loading the dataset directly")
+    return load_material_database(request.app.state.settings.dataset_path)
+
+
+# ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
 class MaxUploadSizeMiddleware:
@@ -271,8 +310,27 @@ def create_app(
              "canonical material vocabulary - never the image - and any Gemini "
              "failure degrades to `ai_material_analysis: {available: false}` "
              "without affecting the deterministic result.  The AI analysis may "
-             "report `primary_material: null` with `uncertain: true` when the "
-             "evidence cannot reliably distinguish materials.\n\n"
+"report `primary_material: null` with `uncertain: true` when the "
+            "evidence cannot reliably distinguish materials.\n\n"
+            "Video analysis is a separate flow that reuses the same deterministic "
+            "pipeline and the same Gemini configuration:\n\n"
+            "* `POST /material-identification` is **deterministic**. It takes the "
+            "aggregated flame colour (`rgb`, `lab`) that a client measured across "
+            "the video frames it analysed, runs the existing LAB matcher against "
+            "the existing `flame_dataset.json` - no detection, no segmentation, no "
+            "LLM - and returns the same material analysis, fire class and "
+            "extinguishing agents as the image workflow. This is the source of "
+            "truth for the video fire class.\n"
+            "* `POST /video-material-analysis` takes the structured per-frame "
+            "evidence of a whole video (numbers only; images and base64 are "
+            "rejected) and performs **one** Gemini request over the entire "
+            "collection, returning **one** consolidated video-level material "
+            "assessment in the same structure as the image AI analysis. Gemini is "
+            "never called per frame, per-frame confidences are never averaged, and "
+            "no single frame's answer is picked out.\n\n"
+            "`GEMINI_API_KEY` and any AWS credentials are read from the server "
+            "environment only: they are never logged, never returned by any "
+            "endpoint and never reachable by the frontend.\n\n"
             "No UI, no tunnels. Models are loaded once per worker process and "
             "reused for every request."
         ),
@@ -523,6 +581,152 @@ def create_app(
         )
         return response
 
+    @application.post(
+        "/material-identification",
+        tags=["analysis"],
+        summary="Identify the material from an aggregated flame colour (deterministic)",
+        responses={
+            200: {
+                "description": (
+                    "The same deterministic material identification the image "
+                    "workflow returns, plus the fire class and extinguishing "
+                    "agents derived from it through the existing mapping."
+                ),
+                "content": {
+                    "application/json": {"example": _MATERIAL_IDENTIFICATION_EXAMPLE}
+                },
+            },
+            422: {
+                "description": (
+                    "The body was malformed: `rgb` and `lab` must each be exactly "
+                    "three numeric values in range."
+                ),
+                "content": {"application/json": {"example": _VALIDATION_EXAMPLE}},
+            },
+            500: {"description": "Unexpected internal failure."},
+            503: {
+                "description": "`flame_dataset.json` could not be loaded.",
+                "content": {"application/json": {"example": _UNAVAILABLE_EXAMPLE}},
+            },
+        },
+    )
+    async def material_identification(
+        request: Request, payload: MaterialIdentificationRequest
+    ) -> JSONResponse:
+        """Run the existing deterministic material matcher on supplied evidence.
+
+        Body: `{"rgb": [R, G, B], "lab": [L, a, b]}` - one aggregated flame colour,
+        which is what a client gets after averaging its analysed video frames.
+        RGB channels are 0-255; LAB is in the `scikit-image` convention the
+        dataset uses (L 0-100, a/b -128..127).
+
+        The colour is handed to the **same**
+        :func:`app.material_matching.match_material` that ``/analyze`` uses,
+        against the **same** canonical `flame_dataset.json`.  There is no second
+        classifier, no duplicated material list and no Gemini call here, and no
+        YOLO detection or segmentation is run - the client already has the
+        evidence.  The fire class and the extinguishing agents come from the
+        existing `app/fire_classes.py` mapping applied to this deterministic
+        match, which is what makes the video fire class trustworthy.
+        """
+        started = time.perf_counter()
+        try:
+            database = _material_database(request)
+            body = identify_material(payload.rgb, payload.lab, database, settings)
+        except AnalysisError as error:
+            return _error_response(error)
+        except Exception:  # noqa: BLE001 - never leak an internal traceback
+            logger.exception("Material identification failed unexpectedly")
+            return _error_response(InferenceError())
+
+        logger.info(
+            "Deterministic material identification complete (material=%s, similarity=%s, total_ms=%.2f)",
+            body.get("primary_material"),
+            body.get("similarity"),
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return JSONResponse(status_code=200, content=body)
+
+    @application.post(
+        "/video-material-analysis",
+        tags=["analysis"],
+        summary="One consolidated AI material assessment for a whole video",
+        responses={
+            200: {
+                "description": (
+                    "Exactly one consolidated video-level material assessment, in the "
+                    "same structure the image AI analysis returns. `available: false` "
+                    "means Gemini could not produce a usable result; the frame counts "
+                    "and `display_threshold_percent` are still reported, and Gemini's "
+                    "confidence is never adjusted to reach it."
+                ),
+                "content": {
+                    "application/json": {"example": _VIDEO_MATERIAL_ANALYSIS_EXAMPLE}
+                },
+            },
+            422: {
+                "description": (
+                    "The body was malformed: `frames` must be a non-empty list of "
+                    "frames, each with exactly three RGB and three LAB numbers. "
+                    "Unknown fields - including any image or base64 payload - are "
+                    "rejected."
+                ),
+                "content": {"application/json": {"example": _VALIDATION_EXAMPLE}},
+            },
+        },
+    )
+    async def video_material_analysis_endpoint(
+        request: Request, payload: VideoMaterialAnalysisRequest
+    ) -> JSONResponse:
+        """Assess a whole video with ONE Gemini request over all frame evidence.
+
+        Body: `{"frames": [{"frame_index", "timestamp_seconds", "rgb", "lab",
+        "detection_confidence", "flame_area_ratio", "segmentation_confidence"},
+        ...]}`.  Only measurements are accepted - never an image, a mask or base64.
+
+        Every frame's evidence goes into a **single** Gemini request and exactly
+        **one** consolidated, video-level material assessment comes back.  Gemini
+        is never called per frame, per-frame confidences are never averaged and
+        neither the first nor the highest-confidence frame's answer is selected;
+        the model is instructed to judge the collection jointly and to let the
+        consistency, quality and amount of evidence across all frames drive its
+        confidence.
+
+        The response is the canonical AI structure - `available`,
+        `primary_material`, `matches`, `overall_confidence_level`, `uncertain`,
+        `evidence_quality`, `reasoning_summary` - plus `frames_supplied`,
+        `frames_analyzed` and `display_threshold_percent` (the frontend's AI-card
+        visibility rule, 45).  A result below the threshold is still returned
+        unchanged.  This endpoint is Gemini-only: the video fire class comes from
+        the deterministic `/material-identification` response.
+        """
+        started = time.perf_counter()
+        try:
+            database = _material_database(request)
+        except AnalysisError:
+            # Not fatal here: the AI analysis reports the missing database itself
+            # as an unavailable result, exactly as the image workflow does.
+            database = None
+
+        try:
+            body = await run_in_threadpool(
+                video_material_analysis, payload.frames, settings, database
+            )
+        except Exception:  # noqa: BLE001 - never leak an internal traceback
+            logger.exception("Video material analysis failed unexpectedly")
+            body = {
+                "available": False,
+                "error": "The video AI material analysis could not be completed.",
+            }
+
+        logger.info(
+            "Video material analysis complete (frames=%s, available=%s, total_ms=%.2f)",
+            body.get("frames_analyzed"),
+            body.get("available"),
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return JSONResponse(status_code=200, content=body)
+
     # -- exception handlers ------------------------------------------------
     @application.exception_handler(RequestValidationError)
     async def validation_exception_handler(
@@ -724,6 +928,98 @@ _UNAVAILABLE_EXAMPLE: dict[str, Any] = {
         "code": "SERVICE_UNAVAILABLE",
         "message": "The analysis service is not ready to accept requests.",
     },
+}
+
+#: `POST /material-identification` - the same deterministic structures
+#: `/analyze` returns, for a flame colour the client aggregated itself.  The
+#: canonical name, the similarity, the alternatives and the fire class all come
+#: from `flame_dataset.json` and `app/fire_classes.py`.
+_MATERIAL_IDENTIFICATION_EXAMPLE: dict[str, Any] = {
+    "success": True,
+    "material_analysis": {
+        "primary_material": "Natural Fibers",
+        "similarity": 0.9268,
+        "alternatives": [
+            {"material": "Paper Products(Wood material)", "similarity": 0.8885},
+            {"material": "Wax Materials", "similarity": 0.8885},
+            {"material": "Wood Materials", "similarity": 0.8851},
+        ],
+        "database_notes": "Yellow flame, cotton burns fast, wool self-extinguishes, ...",
+        "score_basis": "mean LAB distance to flame_dataset.json reference colours",
+    },
+    "primary_material": "Natural Fibers",
+    "similarity": 0.9268,
+    "alternatives": [
+        {"material": "Paper Products(Wood material)", "similarity": 0.8885},
+        {"material": "Wax Materials", "similarity": 0.8885},
+        {"material": "Wood Materials", "similarity": 0.8851},
+    ],
+    "suppression_information": {
+        "source": "flame_dataset.json",
+        "material": "Natural Fibers",
+        "methods": ["Water", "CO2", "Foam"],
+        "database_notes": "Yellow flame, cotton burns fast, wool self-extinguishes, ...",
+    },
+    "fire_class": {
+        "class": "Class A",
+        "description": "Ordinary combustibles",
+        "confidence": 0.9268,
+        "material": "Natural Fibers",
+        "basis": "material 'Natural Fibers' -> Class A via app/fire_classes.py ...",
+        "mapping_source": "app/fire_classes.py (documented material -> fire class mapping)",
+        "notes": "Derived from the matched material; not predicted by the detection model.",
+    },
+    "extinguishing_agents": [
+        {
+            "name": "Water",
+            "compound": None,
+            "type": "cooling",
+            "source": "flame_dataset.json",
+            "fire_class": "Class A",
+            "compound_basis": "name verbatim from flame_dataset.json; ...",
+        },
+        {
+            "name": "CO2",
+            "compound": None,
+            "type": "oxygen_displacement",
+            "source": "flame_dataset.json",
+            "fire_class": "Class A",
+            "compound_basis": "name verbatim from flame_dataset.json; ...",
+        },
+    ],
+}
+
+#: `POST /video-material-analysis` - ONE consolidated result for the whole video,
+#: never one result per frame.  The `matches` list is the single ranked answer for
+#: the video, exactly as for a single image.
+_VIDEO_MATERIAL_ANALYSIS_EXAMPLE: dict[str, Any] = {
+    "available": True,
+    "primary_material": "Natural Fibers",
+    "matches": [
+        {
+            "rank": 1,
+            "material": "Natural Fibers",
+            "confidence_percent": 72.0,
+            "reason": "Consistent yellow-orange colour across all frames supports an organic fuel.",
+        },
+        {
+            "rank": 2,
+            "material": "Paper Products(Wood material)",
+            "confidence_percent": 64.0,
+            "reason": "Also plausible; the frames do not separate paper from fibre.",
+        },
+    ],
+    "overall_confidence_level": "medium",
+    "uncertain": False,
+    "evidence_quality": "moderate",
+    "reasoning_summary": (
+        "All sampled frames of this video show the same yellow-orange flame with a "
+        "blue base, which supports one organic, carbon-based material for the event "
+        "as a whole rather than a per-frame verdict."
+    ),
+    "frames_supplied": 4,
+    "frames_analyzed": 4,
+    "display_threshold_percent": 45.0,
 }
 
 #: Module level application used by ``uvicorn app.api:app``.
