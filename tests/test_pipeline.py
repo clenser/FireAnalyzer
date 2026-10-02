@@ -59,6 +59,7 @@ from app.fire_classes import (  # noqa: E402
     fire_class_for_agents,
     fire_class_for_material,
 )
+from app.detection import detect_fires  # noqa: E402
 from app.imaging import decode_image_bytes, validate_image  # noqa: E402
 from app.mask import (  # noqa: E402
     MASK_ENCODING,
@@ -71,7 +72,12 @@ from app.material_matching import (  # noqa: E402
     match_material,
     suppression_for,
 )
-from app.segmentation import bounding_box_mask, segment_fire  # noqa: E402
+from app.segmentation import (  # noqa: E402
+    _resize_mask,
+    bounding_box_mask,
+    segment_detections,
+    segment_fire,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = ROOT / "app"
@@ -1026,6 +1032,149 @@ def test_agents_in_the_response_are_small_and_flat():
 
 
 # ---------------------------------------------------------------------------
+# Detection: box clipping and degenerate boxes
+# ---------------------------------------------------------------------------
+def test_detect_fires_clips_out_of_bounds_boxes_to_the_image():
+    model = StubModel(_detection_result(box=(-10, -5, 70, 130)))
+    detections = detect_fires(model, _fire_image(100), _settings())
+
+    assert len(detections) == 1
+    box = detections[0].bounding_box
+    assert (box.x1, box.y1, box.x2, box.y2) == (0, 0, 70, 100)
+
+
+def test_detect_fires_drops_a_zero_area_box_after_clipping():
+    model = StubModel(_detection_result(box=(30, 30, 30, 80)))  # zero width
+    assert detect_fires(model, _fire_image(100), _settings()) == []
+
+
+def test_detect_fires_drops_near_duplicate_boxes_keeping_the_more_confident_one():
+    """The model's own NMS can still let a near-identical duplicate through;
+    the extra safety net must drop it rather than report one flame twice,
+    while leaving a genuinely separate flame region untouched."""
+    model = StubModel(
+        [
+            StubResult(
+                [
+                    StubBox((10, 10, 60, 60), 0.92),
+                    StubBox((11, 10, 61, 60), 0.75),  # 1px shift: same flame region
+                    StubBox((70, 70, 95, 95), 0.80),  # a genuinely separate flame
+                ],
+                masks=None,
+            )
+        ]
+    )
+    detections = detect_fires(model, _fire_image(100), _settings())
+
+    assert len(detections) == 2
+    assert sorted(d.confidence for d in detections) == [0.8, 0.92]
+
+
+# ---------------------------------------------------------------------------
+# Detection -> segmentation association: the critical multi-detection path
+# ---------------------------------------------------------------------------
+def test_segment_detections_associates_by_overlap_not_raw_confidence():
+    """A low-confidence mask that truly matches a box must win over a
+    higher-confidence mask that only grazes it - overlap is the primary key,
+    confidence only a tiebreaker."""
+    image = np.zeros((120, 120, 3), dtype=np.uint8)
+    box1 = (10, 10, 50, 50)  # 40x40
+    box2 = (60, 60, 100, 100)  # 40x40
+
+    true_match_1 = np.zeros((120, 120), dtype=np.float32)
+    true_match_1[10:50, 10:50] = 1.0  # exactly box1
+
+    decoy = np.zeros((120, 120), dtype=np.float32)
+    decoy[10:50, 10:20] = 1.0  # a sliver fully inside box1, but a poor match
+
+    true_match_2 = np.zeros((120, 120), dtype=np.float32)
+    true_match_2[60:100, 60:100] = 1.0  # exactly box2
+
+    class ThreeMasks(StubModel):
+        def __call__(self, image, **kwargs):
+            return [
+                StubResult(
+                    [
+                        StubBox(box1, 0.20),
+                        StubBox((10, 10, 20, 50), 0.99),
+                        StubBox(box2, 0.90),
+                    ],
+                    StubMasks(np.stack([true_match_1, decoy, true_match_2])),
+                )
+            ]
+
+    _merged, summary, per_detection = segment_detections(
+        ThreeMasks([]), image, [box1, box2], _settings()
+    )
+
+    assert per_detection[0] is not None
+    assert np.array_equal(per_detection[0] > 0, true_match_1 > 0)
+    assert per_detection[1] is not None
+    assert np.array_equal(per_detection[1] > 0, true_match_2 > 0)
+
+    records = {r["detection_index"]: r for r in summary.detection_masks}
+    assert records[0]["segmentation_confidence"] == 0.20
+    assert records[1]["segmentation_confidence"] == 0.90
+
+
+def test_segment_detections_does_not_share_one_instance_between_two_detections():
+    """A single segmentation instance may be claimed by at most one detection."""
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    box_a = (10, 10, 50, 50)  # the instance's exact match
+    box_b = (20, 20, 60, 60)  # overlaps the same instance, but less precisely
+
+    instance = np.zeros((100, 100), dtype=np.float32)
+    instance[10:50, 10:50] = 1.0
+
+    class OneMask(StubModel):
+        def __call__(self, image, **kwargs):
+            return [StubResult([StubBox(box_a, 0.8)], StubMasks(instance[None, :, :]))]
+
+    _merged, summary, per_detection = segment_detections(
+        OneMask([]), image, [box_a, box_b], _settings()
+    )
+
+    assert per_detection[0] is not None
+    assert np.array_equal(per_detection[0] > 0, instance > 0)
+    records = {r["detection_index"]: r for r in summary.detection_masks}
+    assert records[0]["mask_source"] == "segmentation"
+    # The second detection cannot reuse the instance already claimed above;
+    # it degrades to its own rasterised box instead.
+    assert records[1]["mask_source"] == "bbox_fallback"
+    assert records[1]["mask_pixel_count"] == 40 * 40
+
+
+def test_segment_detections_merges_masks_not_boxes():
+    """The merged mask is the union of the per-detection masks, never the
+    union of the bounding boxes (which would include non-flame pixels)."""
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    box1 = (0, 0, 40, 40)
+    box2 = (60, 60, 100, 100)
+
+    mask1 = np.zeros((100, 100), dtype=np.float32)
+    mask1[10:20, 10:20] = 1.0  # a small L-shaped-like region inside box1
+    mask2 = np.zeros((100, 100), dtype=np.float32)
+    mask2[70:80, 70:80] = 1.0  # a small region inside box2
+
+    class TwoMasks(StubModel):
+        def __call__(self, image, **kwargs):
+            return [
+                StubResult(
+                    [StubBox(box1, 0.8), StubBox(box2, 0.8)],
+                    StubMasks(np.stack([mask1, mask2])),
+                )
+            ]
+
+    merged, summary, _per_detection = segment_detections(
+        TwoMasks([]), image, [box1, box2], _settings()
+    )
+
+    assert int(np.count_nonzero(merged)) == 100 + 100  # the two masks, not the two boxes
+    assert summary.flame_pixel_count == 200
+    assert summary.mask_count == 2
+
+
+# ---------------------------------------------------------------------------
 # Segmentation helpers
 # ---------------------------------------------------------------------------
 def test_bounding_box_mask_clips_to_image():
@@ -1036,6 +1185,17 @@ def test_bounding_box_mask_clips_to_image():
 
 def test_bounding_box_mask_ignores_degenerate_boxes():
     assert np.count_nonzero(bounding_box_mask((50, 50), [[10, 10, 10, 40]])) == 0
+
+
+def test_resize_mask_normalises_to_0_255_even_without_resizing():
+    """A thresholded 0/1 mask already at the target shape must still come
+    out strictly 0/255, not leak the raw 0/1 values past this stage."""
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[5:10, 5:10] = 1  # already thresholded, already the right shape
+    result = _resize_mask(mask, (20, 20))
+    assert set(np.unique(result).tolist()) <= {0, 255}
+    assert int(np.count_nonzero(result)) == 25
+    assert np.array_equal(result > 0, mask > 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,30 +1237,40 @@ def test_analyze_image_returns_json_serialisable_result():
 
 
 def test_analyze_image_keeps_highest_confidence_detection():
+    """``fire_detection`` still reports the single best box, but both
+    non-overlapping detections keep their own independent region: the merged
+    mask is the union of each one's bbox fallback, not just the best box's."""
     results = [StubResult([StubBox((0, 0, 10, 10), 0.5), StubBox((20, 20, 90, 90), 0.93)], None)]
     analyzer = _analyzer_with_stubs(results, None)  # no segmentation model -> bbox fallback
     result = analyzer.analyze_image(_fire_image())
 
+    assert result["detection_count"] == 2
     assert result["fire_detection"]["confidence"] == 0.93
     assert result["fire_detection"]["bounding_box"]["x1"] == 20
     assert result["segmentation"]["available"] is False
     assert result["segmentation"]["fallback_used"] is True
-    assert result["segmentation"]["flame_pixel_count"] == 70 * 70
+    assert result["segmentation"]["flame_pixel_count"] == 10 * 10 + 70 * 70
 
 
 def test_analyze_image_ignores_wrong_class():
     analyzer = _analyzer_with_stubs(_detection_result(cls=1), None)
-    assert analyzer.analyze_image(_fire_image()) == {
-        "success": False,
-        "error": {"code": "NO_FIRE_DETECTED", "message": NoFireDetectedError.message},
-    }
+    result = analyzer.analyze_image(_fire_image())
+
+    assert result["success"] is False
+    assert result["error"] == {"code": "NO_FIRE_DETECTED", "message": NoFireDetectedError.message}
+    # Even a rejected analysis reports how many (zero) detections were found.
+    assert result["detection_count"] == 0
+    assert result["detections"] == []
 
 
 def test_analyze_image_reports_no_flame_pixels():
     empty = np.zeros((100, 100), dtype=np.float32)
-    # A degenerate detection box means the bbox fallback mask is empty too.
+    # A valid detection box, an empty segmentation mask, and the bbox fallback
+    # disabled: no stage produces a single flame pixel.
     analyzer = _analyzer_with_stubs(
-        _detection_result(box=(20, 20, 20, 20)), _segmentation_result((0, 0, 0, 0), 0.85, empty)
+        _detection_result(box=(10, 10, 20, 20)),
+        _segmentation_result((0, 0, 0, 0), 0.85, empty),
+        fallback_to_bbox_mask=False,
     )
     result = analyzer.analyze_image(_fire_image())
     assert result["success"] is False
@@ -1115,12 +1285,34 @@ def test_analyze_image_rejects_invalid_image():
 
 
 def test_analyze_image_hides_unexpected_errors():
+    """A detection-stage crash gets its own specific error code, not the
+    generic catch-all - but the raw exception text is still never leaked."""
     class Exploding:
         def __call__(self, *args, **kwargs):
             raise RuntimeError("boom")
 
     analyzer = _analyzer_with_stubs(_detection_result(), None)
     analyzer._detection_model = Exploding()
+    result = analyzer.analyze_image(_fire_image())
+    assert result["success"] is False
+    assert result["error"]["code"] == "DETECTION_FAILED"
+    assert "boom" not in json.dumps(result)
+
+
+def test_analyze_image_hides_unexpected_non_detection_errors(monkeypatch):
+    """A crash outside the detection stage still falls back to the generic,
+    detail-free inference error instead of leaking exception internals."""
+    import app.analyzer as analyzer_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(analyzer_module, "analyze_flame_colors", boom)
+    mask = np.zeros((100, 100), dtype=np.float32)
+    mask[30:70, 30:70] = 1.0
+    analyzer = _analyzer_with_stubs(
+        _detection_result(), _segmentation_result((30, 30, 70, 70), 0.85, mask)
+    )
     result = analyzer.analyze_image(_fire_image())
     assert result["success"] is False
     assert result["error"]["code"] == "INFERENCE_ERROR"
@@ -1208,12 +1400,17 @@ def test_real_models_report_the_mask_and_all_five_algorithms():
         segmentation["flame_pixel_count"] / decoded.size, abs=1e-6
     )
     assert segmentation["mask_encoding"] == MASK_ENCODING
-    # Whether the model or the box produced the mask is always stated, never implied.
-    if segmentation["fallback_used"]:
-        assert segmentation["available"] is False
+    # With several detections, some can get a real segmentation mask while
+    # others fall back to their own box (e.g. its matching instance was
+    # claimed by a better-overlapping detection) - so `available` and
+    # `fallback_used` are independent per-summary flags, not opposites.  The
+    # per-detection sources are what must actually agree with them.
+    sources = [d["mask_source"] for d in result["detections"]]
+    assert segmentation["available"] == ("segmentation" in sources)
+    assert segmentation["fallback_used"] == ("bbox_fallback" in sources)
+    if segmentation["fallback_used"] or not segmentation["available"]:
         assert segmentation["bbox_fallback_reason"]
     else:
-        assert segmentation["available"] is True
         assert segmentation["bbox_fallback_reason"] is None
 
     # All five retained algorithms, and nothing else.

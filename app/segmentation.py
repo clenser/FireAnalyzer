@@ -54,12 +54,17 @@ def bounding_box_mask(image_shape: Sequence[int], boxes: Sequence[BoxLike]) -> n
 
 
 def _resize_mask(mask: np.ndarray, shape: Sequence[int]) -> np.ndarray:
-    """Resize a binary ``uint8`` mask to ``shape`` (nearest neighbour)."""
+    """Resize a binary ``uint8`` mask to ``shape`` (nearest neighbour).
+
+    Always normalises to 0/255, even when no resize is needed: the raw YOLO
+    mask is 0/1, and returning it unscaled in the "already the right shape"
+    branch (the common case with ``retina_masks=True``) would silently break
+    the 0/255 contract documented on every mask in this module.
+    """
     height, width = int(shape[0]), int(shape[1])
-    if mask.shape[:2] == (height, width):
-        return mask
-    resized = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-    return (resized > 0).astype(np.uint8) * 255
+    if mask.shape[:2] != (height, width):
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    return (mask > 0).astype(np.uint8) * 255
 
 
 def summarize_mask(mask: np.ndarray | None) -> tuple[int, float]:
@@ -228,16 +233,29 @@ def segment_fire(
 # ---------------------------------------------------------------------------
 # Multi-detection segmentation
 # ---------------------------------------------------------------------------
-def _box_inside_fraction(mask: np.ndarray, box: BoxLike) -> float:
-    """Share of a mask's pixels that fall inside ``box`` (0 when the mask is empty)."""
+def _box_mask_iou(mask: np.ndarray, box: BoxLike) -> float:
+    """Geometric IoU between a detection box and a segmentation instance.
+
+    This is the overlap criterion detection-to-mask association is ranked by:
+    intersection of the box rectangle with the mask's own pixels, divided by
+    their union.  Unlike a plain containment fraction, this penalises a mask
+    that only grazes the box (low union coverage) even if every one of its
+    few pixels happens to sit inside the box, so a small, unrelated mask
+    cannot outrank a mask that actually matches the box's extent.
+    """
     height, width = mask.shape[:2]
     x1, y1, x2, y2 = (int(round(float(v))) for v in box[:4])
     x1, x2 = max(0, min(x1, width)), max(0, min(x2, width))
     y1, y2 = max(0, min(y1, height)), max(0, min(y2, height))
-    total = int(np.count_nonzero(mask))
-    if total == 0 or x2 <= x1 or y2 <= y1:
+    box_area = max(0, x2 - x1) * max(0, y2 - y1)
+    mask_area = int(np.count_nonzero(mask))
+    if box_area == 0 or mask_area == 0:
         return 0.0
-    return int(np.count_nonzero(mask[y1:y2, x1:x2])) / float(total)
+    intersection = int(np.count_nonzero(mask[y1:y2, x1:x2]))
+    if intersection == 0:
+        return 0.0
+    union = box_area + mask_area - intersection
+    return intersection / float(union) if union > 0 else 0.0
 
 
 def _segmentation_instances(
@@ -288,15 +306,24 @@ def segment_detections(
     """One mask per detection, merged into a single binary flame mask.
 
     The segmentation model runs **once** on the image.  Each detection box is
-    then paired with the highest-confidence segmentation instance that overlaps
-    it (ties broken by the larger share of that instance inside the box).  A
-    detection with no overlapping instance gets its rasterised box as mask when
+    then paired with a segmentation instance using geometric overlap (IoU)
+    between the box and the instance's own pixels as the *primary* ranking
+    key, with confidence only a tiebreaker; this is what keeps a loosely
+    overlapping but high-confidence mask from stealing a detection away from
+    the instance that actually matches its shape.  Matching is a single
+    deterministic greedy assignment over every (detection, instance) pair
+    sorted by ``(-iou, -confidence, detection_index, instance_index)``, so an
+    instance is claimed by at most one detection - it can never be silently
+    shared between two unrelated boxes.  A detection left unmatched (no
+    overlapping instance, or its only overlapping instances were claimed by a
+    better-matching detection first) gets its rasterised box as mask when
     ``fallback_to_bbox_mask`` is enabled.  Boxes themselves are never merged;
     only the masks are unioned, and the union drives every downstream
     measurement.
 
-    With exactly one detection and no overlapping instance, the globally best
-    instance is used - the original single-detection behaviour.
+    With exactly one detection and no overlapping instance at all, the
+    globally best-confidence instance is used instead of falling back to the
+    box - the original single-detection behaviour.
 
     Returns
     -------
@@ -307,27 +334,37 @@ def segment_detections(
     """
     original_shape = image_bgr.shape[:2]
     instances, model_ran = _segmentation_instances(model, image_bgr, settings)
+    boxes = list(boxes)
+
+    pairs: list[tuple[float, float, int, int]] = []
+    for d_index, box in enumerate(boxes):
+        for i_index, (confidence, mask) in enumerate(instances):
+            iou = _box_mask_iou(mask, box)
+            if iou > 0.0:
+                pairs.append((iou, confidence, d_index, i_index))
+    pairs.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
+
+    assigned_instance_for: dict[int, int] = {}
+    claimed_instances: set[int] = set()
+    for _iou, _confidence, d_index, i_index in pairs:
+        if d_index in assigned_instance_for or i_index in claimed_instances:
+            continue
+        assigned_instance_for[d_index] = i_index
+        claimed_instances.add(i_index)
+
+    if not assigned_instance_for and len(boxes) == 1 and instances:
+        assigned_instance_for[0] = max(range(len(instances)), key=lambda i: instances[i][0])
 
     per_detection: list[np.ndarray | None] = []
     records: list[dict] = []
     used_confidences: list[float] = []
     any_fallback = False
     for index, box in enumerate(boxes):
-        choice: tuple[float, np.ndarray] | None = None
-        best_key: tuple[float, float] | None = None
-        for confidence, mask in instances:
-            inside = _box_inside_fraction(mask, box)
-            if inside <= 0.0:
-                continue
-            key = (confidence, inside)
-            if best_key is None or key > best_key:
-                best_key, choice = key, (confidence, mask)
-        if choice is None and len(boxes) == 1 and instances:
-            choice = max(instances, key=lambda item: item[0])
+        instance_index = assigned_instance_for.get(index)
 
         mask_conf: float | None = None
-        if choice is not None:
-            confidence, mask = choice
+        if instance_index is not None:
+            confidence, mask = instances[instance_index]
             per_detection.append(mask)
             used_confidences.append(confidence)
             source = "segmentation"
