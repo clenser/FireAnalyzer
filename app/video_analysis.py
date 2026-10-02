@@ -3,7 +3,8 @@
 ::
 
     original video file (already hashed/cached by the HTTP layer)
-      -> evenly spaced frame extraction (``FLAME_VIDEO_MAX_FRAMES``)
+      -> evenly spaced frame extraction (client ``frame_count``, clamped to
+         ``[MIN_FRAMES_LIMIT, MAX_FRAMES_LIMIT]``, else ``FLAME_VIDEO_MAX_FRAMES``)
       -> every frame: FlameAnalyzer.process_frame
            (<=3 detections -> <=3 masks -> merged mask -> RGB/LAB -> LAB ranking)
       -> vision evidence (Groq, Gemini fallback) for up to
@@ -22,6 +23,7 @@ import base64
 import logging
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -34,10 +36,18 @@ from .errors import FrameExtractionError, InvalidVideoError
 from .material_fusion import aggregate_video_frames, video_fire_class
 from .vision_providers import safe_flame_crop, unavailable_vision, vision_evidence_for_crop
 
-__all__ = ["MAX_FRAMES_LIMIT", "REPRESENTATIVE_FRAMES", "analyze_video_file"]
+__all__ = [
+    "MIN_FRAMES_LIMIT",
+    "MAX_FRAMES_LIMIT",
+    "REPRESENTATIVE_FRAMES",
+    "resolve_frame_count",
+    "analyze_video_file",
+]
 
 logger = logging.getLogger(__name__)
 
+#: Safe bounds for the client-supplied ``frame_count`` (see ``resolve_frame_count``).
+MIN_FRAMES_LIMIT = 3
 MAX_FRAMES_LIMIT = 60
 REPRESENTATIVE_FRAMES = 3
 _MAX_COUNTED_FRAMES = 200_000
@@ -48,6 +58,18 @@ _VISION_WORKERS = 3
 
 def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000.0, 2)
+
+
+def resolve_frame_count(frame_count: int | None, settings: Settings) -> int:
+    """Clamp a client-requested frame count to the safe server-side range.
+
+    ``None`` preserves the existing server-default behaviour
+    (``settings.video_max_frames``).  The same resolved value must be used
+    both for sampling and for the video cache identity, so this is the single
+    place that decides it.
+    """
+    base = int(frame_count) if frame_count is not None else int(settings.video_max_frames)
+    return max(MIN_FRAMES_LIMIT, min(MAX_FRAMES_LIMIT, base))
 
 
 def _evenly_spaced(total: int, count: int) -> list[int]:
@@ -138,6 +160,48 @@ def _extract_frames(path: str, max_frames: int) -> tuple[list[tuple[int, float, 
     return frames, info
 
 
+def _top_match(leaders: list[str]) -> dict[str, Any] | None:
+    """Most common leader across frames, with its share - or ``None`` if none voted."""
+    if not leaders:
+        return None
+    counts = Counter(leaders)
+    name, count = counts.most_common(1)[0]
+    return {"material": name, "frames": count, "share": round(count / len(leaders), 4)}
+
+
+def _evidence_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-frame colour/vision leaders, independent of the fused per-frame decision.
+
+    This always reports the strongest available evidence - including when the
+    consolidated video material is uncertain/null - by reading each frame's
+    existing ``supporting_evidence`` (set by :func:`app.material_fusion.fuse_material`)
+    rather than recomputing anything.
+    """
+    successful = [r for r in results if r.get("success")]
+    det_leaders = [
+        (r.get("supporting_evidence") or {}).get("deterministic_leader")
+        for r in successful
+        if (r.get("supporting_evidence") or {}).get("deterministic_leader")
+    ]
+    vis_leaders = [
+        (r.get("supporting_evidence") or {}).get("vision_leader")
+        for r in successful
+        if (r.get("supporting_evidence") or {}).get("vision_leader")
+    ]
+    return {
+        "top_colour_match": _top_match(det_leaders),
+        "top_vision_match": _top_match(vis_leaders),
+        "colour_distribution": [
+            {"material": name, "frames": count} for name, count in Counter(det_leaders).most_common()
+        ],
+        "vision_distribution": [
+            {"material": name, "frames": count} for name, count in Counter(vis_leaders).most_common()
+        ],
+        "colour_frames_considered": len(det_leaders),
+        "vision_frames_considered": len(vis_leaders),
+    }
+
+
 def _representatives(results: list[dict[str, Any]], final_material: str | None) -> list[int]:
     """Up to three frame positions: best-confidence frame in each third of the timeline.
 
@@ -166,10 +230,18 @@ def analyze_video_file(
     analyzer: FlameAnalyzer,
     settings: Settings,
     lock: threading.Lock,
+    frame_count: int | None = None,
 ) -> dict[str, Any]:
-    """Analyse a video file on disk.  Raises only for invalid/corrupt input."""
+    """Analyse a video file on disk.  Raises only for invalid/corrupt input.
+
+    ``frame_count`` is the already-validated, client-requested total sampled
+    frame count (see ``resolve_frame_count``); ``None`` keeps the server
+    default.  It only changes how many frames are sampled for the
+    deterministic pipeline - the vision-analysis budget stays
+    ``settings.video_vision_frames`` regardless.
+    """
     started = time.perf_counter()
-    max_frames = max(1, min(MAX_FRAMES_LIMIT, int(settings.video_max_frames)))
+    max_frames = resolve_frame_count(frame_count, settings)
 
     stage = time.perf_counter()
     frames, info = _extract_frames(path, max_frames)
@@ -244,10 +316,18 @@ def analyze_video_file(
         "none" if not provider_counts else next(iter(provider_counts)) if len(provider_counts) == 1 else "mixed"
     )
 
+    evidence_summary = _evidence_summary(results)
+    detection_summary = {
+        "flame_frames": len(successful),
+        "sampled_frames": len(results),
+        "text": f"Flame seen in {len(successful)} of {len(results)} sampled frames",
+    }
+
     payload: dict[str, Any] = {
         "success": bool(successful),
         "analysis_type": "video",
         "video": info,
+        "detection_summary": detection_summary,
         "detection_count": sum(int(r.get("detection_count") or 0) for r in results),
         "mask_count": sum(int(r.get("mask_count") or 0) for r in results),
         "frames_with_flame": len(successful),
@@ -264,6 +344,7 @@ def analyze_video_file(
         "uncertainty_reasons": aggregate["uncertainty_reasons"],
         "leading_candidates": aggregate["leading_candidates"],
         "candidate_materials": aggregate["votes"],
+        "evidence_summary": evidence_summary,
         "consolidated": aggregate,
         "fire_class": fire_class,
         "extinguishing_agents": agents,

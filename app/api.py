@@ -70,7 +70,7 @@ from .errors import (
 from .gemini_analysis import gemini_material_analysis
 from .imaging import decode_image_bytes
 from .material_matching import MaterialDatabase, load_material_database
-from .video_analysis import analyze_video_file
+from .video_analysis import MAX_FRAMES_LIMIT, MIN_FRAMES_LIMIT, analyze_video_file, resolve_frame_count
 from .video_material import (
     MaterialIdentificationRequest,
     VideoMaterialAnalysisRequest,
@@ -662,7 +662,12 @@ def create_app(
             400: {"description": "The upload is not a decodable video (`INVALID_VIDEO`, `FRAME_EXTRACTION_FAILED`)."},
             413: {"description": "The upload exceeded `FLAME_MAX_VIDEO_MB` (`VIDEO_TOO_LARGE`)."},
             415: {"description": "The upload is not a video (`UNSUPPORTED_MEDIA`)."},
-            422: {"description": "The `video` field is missing (`VALIDATION_ERROR`)."},
+            422: {
+                "description": (
+                    "The `video` field is missing, or `frame_count` is not an integer in "
+                    f"[{MIN_FRAMES_LIMIT}, {MAX_FRAMES_LIMIT}] (`VALIDATION_ERROR`)."
+                )
+            },
             503: {"description": "Models are not loaded."},
         },
     )
@@ -673,16 +678,31 @@ def create_app(
             False,
             description="Ignore any cached result, re-run the full analysis and replace the cache entry.",
         ),
+        frame_count: int | None = Form(
+            None,
+            ge=MIN_FRAMES_LIMIT,
+            le=MAX_FRAMES_LIMIT,
+            description=(
+                "Total number of evenly spaced frames to sample from the video "
+                f"({MIN_FRAMES_LIMIT}-{MAX_FRAMES_LIMIT}). Omit to use the server "
+                "default (`FLAME_VIDEO_MAX_FRAMES`). Does not change how many of "
+                "those frames receive AI vision analysis - that stays governed by "
+                "`FLAME_VIDEO_VISION_FRAMES`."
+            ),
+        ),
     ) -> JSONResponse:
         """Full server-side video analysis.
 
-        The cache key is the SHA-256 of the **original video file**.  Evenly
-        spaced frames (`FLAME_VIDEO_MAX_FRAMES`) each go through the image
-        pipeline (<=3 detections, <=3 masks, merged mask, RGB/LAB evidence,
-        vision evidence for up to `FLAME_VIDEO_VISION_FRAMES` frames, Python
-        fusion).  The video material and fire class come from a Python
-        majority/consistency vote over the frame decisions - never from an LLM.
-        Returns `representative_frames` (up to 3) and every frame in `frames`.
+        The cache key is the SHA-256 of the **original video file** combined
+        with the effective `frame_count`, so the same video analysed with a
+        different `frame_count` is cached separately.  Evenly spaced frames
+        (`frame_count`, or `FLAME_VIDEO_MAX_FRAMES` when omitted) each go
+        through the image pipeline (<=3 detections, <=3 masks, merged mask,
+        RGB/LAB evidence, vision evidence for up to `FLAME_VIDEO_VISION_FRAMES`
+        frames, Python fusion).  The video material and fire class come from a
+        Python majority/consistency vote over the frame decisions - never from
+        an LLM.  Returns `representative_frames` (up to 3) and every frame in
+        `frames`.
         """
         started = time.perf_counter()
         force = force_new_analysis or _query_flag(request, "force_new_analysis")
@@ -694,6 +714,7 @@ def create_app(
         except AnalysisError as error:
             return _error_response(error)
 
+        effective_frame_count = resolve_frame_count(frame_count, settings)
         limit = max(1, int(settings.max_video_mb)) * BYTES_PER_MB
         suffix = Path(video.filename or "").suffix.lower()
         suffix = suffix if suffix in _VIDEO_EXTENSIONS else ".mp4"
@@ -711,8 +732,9 @@ def create_app(
                 return _error_response(MissingUploadError("No video file was provided in the 'video' field."))
 
             cache: AnalysisCache = request.app.state.cache
+            cache_digest = sha256_hex(f"{digest}:frames={effective_frame_count}".encode("ascii"))
             if not force:
-                cached = await run_in_threadpool(cache.get, "video", digest)
+                cached = await run_in_threadpool(cache.get, "video", cache_digest)
                 if cached is not None:
                     cached["cached"] = True
                     logger.info("Video analysis served from cache")
@@ -725,6 +747,7 @@ def create_app(
                     analyzer,
                     settings,
                     request.app.state.inference_lock,
+                    effective_frame_count,
                 )
             except AnalysisError as error:
                 return _error_response(error)
@@ -734,11 +757,12 @@ def create_app(
 
             result["cached"] = False
             if _cacheable(result):
-                await run_in_threadpool(cache.set, "video", digest, result)
+                await run_in_threadpool(cache.set, "video", cache_digest, result)
             logger.info(
-                "Video analysis complete (success=%s, frames=%s, total_ms=%.2f)",
+                "Video analysis complete (success=%s, frames=%s, frame_count=%s, total_ms=%.2f)",
                 result.get("success"),
                 (result.get("video") or {}).get("frames_sampled"),
+                effective_frame_count,
                 (time.perf_counter() - started) * 1000.0,
             )
             return _result_response(result)
