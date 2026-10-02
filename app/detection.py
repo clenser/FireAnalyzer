@@ -1,8 +1,12 @@
 """Fire detection stage - wraps the custom ``OBJ_best.pt`` YOLO model.
 
-Behaviour preserved from the original implementation: only detections of the
-fire class above the confidence threshold are considered and the single
-highest-confidence detection is kept.
+Only detections of the fire class above the confidence threshold are
+considered.  Up to :data:`MAX_DETECTIONS` of them are kept, ordered by
+confidence (highest first).  Boxes are never merged: each detection keeps its
+own rectangle and later receives its own segmentation mask.
+
+:func:`detect_fire` keeps the original single-detection contract (the best
+box) for callers that only need one.
 """
 
 from __future__ import annotations
@@ -12,13 +16,17 @@ import logging
 from .config import Settings
 from .schemas import BoundingBox, FireDetection
 
-__all__ = ["detect_fire", "boxes_from_detection"]
+__all__ = ["MAX_DETECTIONS", "detect_fires", "detect_fire", "boxes_from_detection"]
 
 logger = logging.getLogger(__name__)
 
 
-def detect_fire(model, image_bgr, settings: Settings) -> FireDetection:
-    """Run fire detection and return the best-scoring detection.
+#: Hard upper bound on the number of flame detections kept per image/frame.
+MAX_DETECTIONS = 3
+
+
+def detect_fires(model, image_bgr, settings: Settings, max_detections: int = MAX_DETECTIONS) -> list[FireDetection]:
+    """Run fire detection and return up to ``max_detections`` detections.
 
     Parameters
     ----------
@@ -28,15 +36,19 @@ def detect_fire(model, image_bgr, settings: Settings) -> FireDetection:
         Input image as an OpenCV BGR array.
     settings:
         Active configuration (image size, thresholds, class id).
+    max_detections:
+        Upper bound, clamped to ``1..MAX_DETECTIONS``.
 
     Returns
     -------
-    FireDetection
-        ``detected=False`` when nothing passes the confidence threshold.
+    list[FireDetection]
+        Highest confidence first; empty when nothing passes the threshold.
+        Ties are broken by box position so the order is deterministic.
     """
     if model is None:
-        raise RuntimeError("detect_fire() called without a loaded detection model")
+        raise RuntimeError("detect_fires() called without a loaded detection model")
 
+    limit = max(1, min(MAX_DETECTIONS, int(max_detections)))
     results = model(
         image_bgr,
         imgsz=settings.imgsz,
@@ -60,16 +72,23 @@ def detect_fire(model, image_bgr, settings: Settings) -> FireDetection:
                 continue
             candidates.append((confidence, [int(round(float(v))) for v in xyxy]))
 
-    if not candidates:
-        return FireDetection(detected=False, confidence=0.0, bounding_box=None)
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return [
+        FireDetection(
+            detected=True,
+            confidence=round(float(confidence), 4),
+            bounding_box=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
+        )
+        for confidence, (x1, y1, x2, y2) in candidates[:limit]
+    ]
 
-    # Keep the highest-confidence detection, exactly as the original pipeline did.
-    confidence, (x1, y1, x2, y2) = max(candidates, key=lambda item: item[0])
-    return FireDetection(
-        detected=True,
-        confidence=round(float(confidence), 4),
-        bounding_box=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2),
-    )
+
+def detect_fire(model, image_bgr, settings: Settings) -> FireDetection:
+    """Single best detection (original contract); ``detected=False`` when none."""
+    detections = detect_fires(model, image_bgr, settings, max_detections=1)
+    if not detections:
+        return FireDetection(detected=False, confidence=0.0, bounding_box=None)
+    return detections[0]
 
 
 def boxes_from_detection(detection: FireDetection) -> list[list[int]]:

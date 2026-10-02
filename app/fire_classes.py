@@ -79,6 +79,7 @@ __all__ = [
     "agent_suppression_type",
     "extinguishing_agents_for",
     "classify",
+    "classify_decision",
 ]
 
 logger = logging.getLogger(__name__)
@@ -314,4 +315,62 @@ def classify(
             notes=_CLASS_BASIS,
         ),
         extinguishing_agents_for(material, agents, fire_class),
+    )
+
+
+def classify_decision(
+    database: MaterialDatabase,
+    material: str | None,
+    leading_candidates: Sequence[str],
+    confidence: float,
+) -> tuple[FireClassResult, list[ExtinguishingAgent]]:
+    """Fire class for a fused material decision, including an uncertain one.
+
+    A decided material goes through :func:`classify` unchanged.  When the
+    material is uncertain, the same mapping is applied to every tied leading
+    candidate: if they all map to one fire class, that class is reported with
+    only the agents every candidate's dataset record lists; otherwise the
+    class is :data:`UNKNOWN_CLASS`.  Nothing is guessed.
+    """
+    if material:
+        return classify(database, material, confidence)
+
+    entries = [database.get(name) for name in leading_candidates]
+    entries = [entry for entry in entries if entry is not None]
+    classes = {fire_class_for_material(entry.name, list(entry.extinguishers))[0] for entry in entries}
+    if len(classes) != 1 or UNKNOWN_CLASS in classes:
+        names = ", ".join(entry.name for entry in entries) or "none"
+        return (
+            FireClassResult(
+                class_=UNKNOWN_CLASS,
+                description=CLASS_DESCRIPTIONS[UNKNOWN_CLASS],
+                confidence=0.0,
+                material=None,
+                basis=f"material is uncertain (candidates: {names}) and they do not share one fire class",
+                mapping_source=MAPPING_SOURCE,
+                notes=_CLASS_BASIS,
+            ),
+            [],
+        )
+
+    fire_class = classes.pop()
+    shared = _normalise(entries[0].extinguishers)
+    for entry in entries[1:]:
+        shared &= _normalise(entry.extinguishers)
+    agents = [name for name in entries[0].extinguishers if name.strip().casefold() in shared]
+    names = ", ".join(entry.name for entry in entries)
+    return (
+        FireClassResult(
+            class_=fire_class,
+            description=CLASS_DESCRIPTIONS.get(fire_class, ""),
+            confidence=round(float(confidence), 4),
+            material=None,
+            basis=(
+                f"material is uncertain between {names}; every candidate maps to "
+                f"{fire_class} via {MAPPING_SOURCE}"
+            ),
+            mapping_source=MAPPING_SOURCE,
+            notes=_CLASS_BASIS,
+        ),
+        extinguishing_agents_for(None, agents, fire_class),
     )

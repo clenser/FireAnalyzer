@@ -25,6 +25,7 @@ __all__ = [
     "DEFAULT_DETECTION_MODEL",
     "DEFAULT_SEGMENTATION_MODEL",
     "DEFAULT_DATASET",
+    "DEFAULT_ACTIVITY_FILE",
 ]
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
@@ -34,6 +35,9 @@ DATA_DIR: Path = PROJECT_ROOT / "data"
 DEFAULT_DETECTION_MODEL: Path = MODELS_DIR / "OBJ_best.pt"
 DEFAULT_SEGMENTATION_MODEL: Path = MODELS_DIR / "SEG_best.pt"
 DEFAULT_DATASET: Path = DATA_DIR / "flame_dataset.json"
+
+#: File the EC2 inactivity watchdog reads.  Only ``POST /activity`` updates it.
+DEFAULT_ACTIVITY_FILE = "/var/lib/flame-analyzer/last-activity"
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -154,6 +158,19 @@ class Settings:
         Hard timeout for one Gemini request.  A slow or hung request is abandoned
         after this many seconds and reported as an unavailable AI analysis; it
         never blocks the ``/analyze`` response indefinitely.
+    groq_api_key, groq_model, groq_timeout_s:
+        Primary vision evidence provider (``GROQ_API_KEY`` / ``GROQ_MODEL`` /
+        ``GROQ_TIMEOUT_S``).  Groq is used only when both the key and the model
+        are set; otherwise the Gemini vision fallback is tried.
+    vision_enabled:
+        Master switch for vision evidence (``FLAME_VISION_ENABLED``).
+    cache_enabled, cache_dir:
+        48-hour result cache keyed by the SHA-256 of the uploaded file.  When
+        ``cache_dir`` is unset the cache lives in
+        ``/var/lib/flame-analyzer/cache`` if writable, else the system temp dir.
+    max_video_mb, video_max_frames, video_vision_frames:
+        Video upload limit, number of evenly spaced frames analysed per video,
+        and how many of those frames receive vision evidence.
     """
 
     # --- artifacts -----------------------------------------------------
@@ -208,13 +225,28 @@ class Settings:
     cors_origins: tuple[str, ...] = ()
     #: File whose modification time is refreshed on every ``POST /activity``
     #: heartbeat.  The EC2 inactivity watchdog monitors this path.
-    activity_file: str = "/var/run/flame-analyzer-last-activity"
+    activity_file: str = DEFAULT_ACTIVITY_FILE
 
     # --- Gemini (secondary AI material analysis) -------------------------
     gemini_enabled: bool = False
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.5-flash-lite"
     gemini_timeout_s: float = 30.0
+
+    # --- Vision evidence (Groq primary, Gemini vision fallback) ----------
+    vision_enabled: bool = True
+    groq_api_key: str | None = None
+    groq_model: str | None = None
+    groq_timeout_s: float = 20.0
+
+    # --- 48-hour analysis cache ----------------------------------------
+    cache_enabled: bool = True
+    cache_dir: str | None = None
+
+    # --- Video ---------------------------------------------------------
+    max_video_mb: int = 50
+    video_max_frames: int = 12
+    video_vision_frames: int = 6
 
     # ------------------------------------------------------------------
     @classmethod
@@ -258,11 +290,20 @@ class Settings:
             ultralytics_verbose=_env_bool("FLAME_YOLO_VERBOSE", False),
             max_image_mb=_env_int("FLAME_MAX_IMAGE_MB", 10),
             cors_origins=_env_list("FLAME_CORS_ORIGINS"),
-            activity_file=os.environ.get("FLAME_ACTIVITY_FILE") or "/var/run/flame-analyzer-last-activity",
+            activity_file=os.environ.get("FLAME_ACTIVITY_FILE") or DEFAULT_ACTIVITY_FILE,
             gemini_enabled=_env_bool("GEMINI_ENABLED", False),
             gemini_api_key=os.environ.get("GEMINI_API_KEY") or None,
             gemini_model=os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash-lite",
             gemini_timeout_s=_env_float("GEMINI_TIMEOUT_S", 30.0),
+            vision_enabled=_env_bool("FLAME_VISION_ENABLED", True),
+            groq_api_key=os.environ.get("GROQ_API_KEY") or None,
+            groq_model=(os.environ.get("GROQ_MODEL") or "").strip() or None,
+            groq_timeout_s=_env_float("GROQ_TIMEOUT_S", 20.0),
+            cache_enabled=_env_bool("FLAME_CACHE_ENABLED", True),
+            cache_dir=os.environ.get("FLAME_CACHE_DIR") or None,
+            max_video_mb=_env_int("FLAME_MAX_VIDEO_MB", 50),
+            video_max_frames=_env_int("FLAME_VIDEO_MAX_FRAMES", 12),
+            video_vision_frames=_env_int("FLAME_VIDEO_VISION_FRAMES", 6),
         )
 
     def with_overrides(self, **kwargs: object) -> "Settings":

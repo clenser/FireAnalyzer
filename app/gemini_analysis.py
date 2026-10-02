@@ -48,15 +48,12 @@ from .material_matching import MaterialDatabase, load_material_database
 
 __all__ = [
     "SYSTEM_INSTRUCTION",
-    "VIDEO_SYSTEM_INSTRUCTION",
-    "VIDEO_CONSOLIDATION_INSTRUCTION",
     "REQUIRED_CANDIDATES",
     "EVIDENCE_QUALITY_LEVELS",
     "CONFIDENCE_LEVELS",
     "GeminiMatch",
     "GeminiTimeoutError",
     "gemini_material_analysis",
-    "gemini_video_material_analysis",
 ]
 
 logger = logging.getLogger(__name__)
@@ -102,19 +99,6 @@ Do not assume that the visually closest material is the actual burning material.
 A flame's color is weak evidence for material identity: different fuels can produce overlapping flame colors, and camera exposure, white balance and the background environment affect the measured values."""
 
 SYSTEM_INSTRUCTION = f"""{_EVIDENCE_INSTRUCTION}
-
-Return structured JSON only."""
-
-#: The one rule that makes a video assessment different from an image assessment:
-#: the frames are samples of a single event, not independent classifications to be
-#: scored and averaged.
-VIDEO_CONSOLIDATION_INSTRUCTION = """The supplied observations are multiple samples of the same fire event. Evaluate the complete collection jointly and return ONE consolidated material assessment for the video. Do not independently classify each frame and average confidence percentages. Confidence must reflect the consistency, quality, and amount of evidence across the complete set of observations."""
-
-VIDEO_SYSTEM_INSTRUCTION = f"""{_EVIDENCE_INSTRUCTION}
-
-{VIDEO_CONSOLIDATION_INSTRUCTION}
-
-Return exactly one consolidated assessment for the video. Never return one assessment per observation, and never derive it by averaging per-observation confidences.
 
 Return structured JSON only."""
 
@@ -208,9 +192,7 @@ def _generate(
 ) -> Any:
     """One structured-output content generation call.
 
-    ``system_instruction`` defaults to the single-image instruction, so the image
-    workflow's Gemini configuration is unchanged; the video workflow passes
-    :data:`VIDEO_SYSTEM_INSTRUCTION`.
+    ``system_instruction`` defaults to the single-image instruction.
     """
     from google.genai import types
 
@@ -381,121 +363,6 @@ def _build_user_content(evidence: dict[str, Any], database: MaterialDatabase) ->
             "\"insufficient\" (or \"limited\" if some weak signal exists).",
             "- confidence_percent expresses how strongly the evidence supports each candidate, not "
             "color closeness; it is a heuristic score, not a calibrated probability.",
-            f"- Return exactly {REQUIRED_CANDIDATES} ranked candidates, copying every material name "
-            "verbatim from the canonical vocabulary above.",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def _format_frame_evidence(frame: dict[str, Any]) -> str:
-    """One line per frame: its measured colour and whatever else was supplied."""
-    mean_color = frame.get("mean_color") or {}
-    position = f"frame {frame.get('frame_index')}"
-    if frame.get("timestamp_seconds") is not None:
-        position += f" at t={frame['timestamp_seconds']}s"
-
-    bits = [f"- {position}: RGB {_format_color_list(mean_color.get('rgb'))}"]
-    bits.append(f"LAB {_format_color_list(mean_color.get('lab'))}")
-    hsv = frame.get("hsv")
-    if isinstance(hsv, dict):
-        bits.append(f"HSV H={hsv.get('h')} deg S={hsv.get('s')}% V={hsv.get('v')}%")
-    if frame.get("brightness_0_255") is not None:
-        bits.append(f"brightness {frame['brightness_0_255']} (0-255)")
-    if frame.get("saturation_0_100") is not None:
-        bits.append(f"saturation {frame['saturation_0_100']}%")
-    if frame.get("detection_confidence") is not None:
-        bits.append(f"detection confidence {frame['detection_confidence']}")
-    if frame.get("segmentation_confidence") is not None:
-        bits.append(f"segmentation confidence {frame['segmentation_confidence']}")
-    region = frame.get("flame_region") or {}
-    if region.get("mask_area_ratio") is not None:
-        bits.append(f"flame area {100.0 * float(region['mask_area_ratio']):.2f}% of the frame")
-    return ", ".join(bits)
-
-
-def _format_collection_summary(collection: dict[str, Any]) -> list[str]:
-    """Whole-collection statistics: consistency and amount of evidence."""
-    lines: list[str] = []
-    lines.append(
-        f"- Observations analysed: {collection.get('frame_count')} frames of one fire event"
-    )
-    if collection.get("time_span_seconds") is not None:
-        lines.append(f"- Observed time span: {collection['time_span_seconds']}s")
-    lines.append(f"- Mean RGB across the frames: {_format_color_list(collection.get('mean_rgb'))}")
-    lines.append(f"- Mean LAB across the frames: {_format_color_list(collection.get('mean_lab'))}")
-    lines.append(
-        f"- Per-channel LAB standard deviation across the frames "
-        f"(0 means every frame measured the same colour): "
-        f"{_format_color_list(collection.get('lab_std_dev'))}"
-    )
-    if collection.get("mean_detection_confidence") is not None:
-        lines.append(
-            f"- Mean fire detection confidence across the frames: "
-            f"{collection['mean_detection_confidence']}"
-        )
-    if collection.get("mean_segmentation_confidence") is not None:
-        lines.append(
-            f"- Mean flame segmentation confidence across the frames: "
-            f"{collection['mean_segmentation_confidence']}"
-        )
-    if collection.get("mean_flame_area_ratio") is not None:
-        lines.append(
-            f"- Mean flame area across the frames: "
-            f"{100.0 * float(collection['mean_flame_area_ratio']):.2f}% of the frame"
-        )
-    return lines
-
-
-def _build_video_user_content(evidence: dict[str, Any], database: MaterialDatabase) -> str:
-    """The user message for a whole video: every frame's evidence, plus the rules.
-
-    ``evidence`` is the collection built by
-    :func:`app.video_material.build_video_evidence`.  Every analysed frame appears
-    individually, and the cross-frame statistics are supplied alongside so the
-    model can judge consistency - the consolidation
-    :data:`VIDEO_CONSOLIDATION_INSTRUCTION` demands.  Only numbers are sent: no
-    image, no mask, no base64, not even a filename.
-    """
-    frames = evidence.get("frames") or []
-    collection = evidence.get("collection") or {}
-
-    lines = [
-        f"Structured flame evidence for one video: {evidence.get('frame_count', len(frames))} "
-        "frames sampled from a single fire event.",
-        "These are numerical measurements of the flame, not the fuel, and no images are supplied.",
-        "",
-        "Per-frame observations:",
-    ]
-    lines.extend(_format_frame_evidence(frame) for frame in frames)
-
-    lines.append("")
-    lines.append("Whole-collection statistics (measured across all frames, not a per-frame verdict):")
-    lines.extend(_format_collection_summary(collection))
-
-    lines.extend(_vocabulary_lines(database))
-    lines.extend(
-        [
-            "",
-            VIDEO_CONSOLIDATION_INSTRUCTION,
-            "",
-            "Instructions:",
-            "- Evaluate the complete collection of frames jointly as one fire event.",
-            "- Do not classify the frames independently and do not average their confidence "
-            "percentages; return ONE consolidated material assessment for the video.",
-            "- Let the consistency of the observations across the frames, the amount of evidence "
-            "and the measurement confidences drive the reported confidence and "
-            "evidence_quality.",
-            "- Flame color is weak evidence for material identity; do not select a material merely "
-            "because its documented flame color is closest to the measurements.",
-            "- If several materials remain plausible, return them as ranked candidates with low or "
-            "medium confidence and set uncertain to true.",
-            "- If the observations cannot reliably distinguish materials, set primary_material to "
-            "null, uncertain to true, overall_confidence_level to \"low\" and evidence_quality to "
-            "\"insufficient\" (or \"limited\" if some weak signal exists).",
-            "- confidence_percent expresses how strongly the complete set of observations supports "
-            "each candidate, not color closeness; it is a heuristic score, not a calibrated "
-            "probability.",
             f"- Return exactly {REQUIRED_CANDIDATES} ranked candidates, copying every material name "
             "verbatim from the canonical vocabulary above.",
         ]
@@ -728,77 +595,6 @@ def gemini_material_analysis(
 
     contents = _build_user_content(evidence, db)
     response, failure = _call_gemini(contents, settings, SYSTEM_INSTRUCTION)
-    if failure is not None:
-        return failure
-
-    return _validated_result(response, canonical, expected)
-
-
-# ---------------------------------------------------------------------------
-# Public entry point - whole video, one consolidated result
-# ---------------------------------------------------------------------------
-def gemini_video_material_analysis(
-    evidence: dict[str, Any],
-    settings: Settings,
-    database: MaterialDatabase | None = None,
-) -> dict[str, Any]:
-    """Run **one** Gemini request over a whole collection of frame observations.
-
-    The supplied evidence is the collection built by
-    :func:`app.video_material.build_video_evidence`: every analysed frame with its
-    measured RGB/LAB, HSV, brightness, saturation, detection/segmentation
-    confidence and flame-area ratio, plus the cross-frame statistics.
-
-    What this function guarantees:
-
-    * **Exactly one** ``generate_content`` call for the entire collection, and
-      exactly one consolidated result.  It never calls Gemini per frame, never
-      averages per-frame confidences or classifications, and never picks the
-      first or the highest-confidence frame's answer - those are all
-      per-frame strategies this entry point exists to replace.
-    * The prompt carries :data:`VIDEO_CONSOLIDATION_INSTRUCTION`, so the model is
-      told to judge the collection jointly and to let consistency, quality and
-      amount of evidence drive the confidence.
-    * **No images, masks or base64** are sent, and the frames are not re-encoded
-      or re-measured here; only the supplied numbers are rendered into the prompt.
-    * Gemini's ``confidence_percent`` is returned unchanged, including values
-      below any client display threshold.
-
-    Parameters
-    ----------
-    evidence:
-        The whole-collection evidence payload (see
-        :func:`app.video_material.build_video_evidence`).
-    settings:
-        Active configuration (``gemini_enabled``, ``gemini_api_key``,
-        ``gemini_model``, ``gemini_timeout_s``) - the same Gemini configuration
-        the image workflow uses.
-    database:
-        The loaded material database.  Loaded from ``settings.dataset_path``
-        when not supplied.
-
-    Returns
-    -------
-    dict
-        The same structure :func:`gemini_material_analysis` returns: one
-        consolidated ``{"available": True, ...}`` result, or
-        ``{"available": False, "error": "..."}``.  Never raises.
-    """
-    db, failure = _prepare_database(settings, database)
-    if failure is not None:
-        return failure
-
-    canonical, expected, failure = _expected_candidates(db)
-    if failure is not None:
-        return failure
-
-    frames = evidence.get("frames") if isinstance(evidence, dict) else None
-    if not isinstance(frames, list) or not frames:
-        return _unavailable("No flame colour evidence was supplied for the AI analysis.")
-
-    contents = _build_video_user_content(evidence, db)
-    # One request for the whole collection.  See the module docstring.
-    response, failure = _call_gemini(contents, settings, VIDEO_SYSTEM_INSTRUCTION)
     if failure is not None:
         return failure
 

@@ -33,6 +33,7 @@ __all__ = [
     "MaterialDatabase",
     "load_material_database",
     "match_material",
+    "rank_materials",
     "suppression_for",
 ]
 
@@ -148,6 +149,32 @@ def _score_entry(
     return float(np.mean(scores))
 
 
+def rank_materials(
+    flame_colors: Sequence[RepresentativeColor],
+    database: MaterialDatabase,
+    settings: Settings,
+) -> list[MaterialScore]:
+    """Every canonical material with its similarity, best first.
+
+    Equal similarities keep dataset order (a stable sort) - never alphabetical
+    order.  Genuine ties are resolved downstream by
+    :mod:`app.material_fusion`, which reports them as uncertain.
+    """
+    colors = [color for color in flame_colors if color is not None]
+    if not colors:
+        raise ValueError("rank_materials() requires at least one representative colour")
+    return sorted(
+        (
+            MaterialScore(
+                material=entry.name,
+                similarity=round(_score_entry(entry, colors, settings), SIMILARITY_DECIMALS),
+            )
+            for entry in database.entries
+        ),
+        key=lambda score: -score.similarity,
+    )
+
+
 def match_material(
     flame_colors: Sequence[RepresentativeColor],
     database: MaterialDatabase,
@@ -170,21 +197,7 @@ def match_material(
         The ranked material analysis plus the suppression record copied from the
         database for the winning material.
     """
-    colors = [color for color in flame_colors if color is not None]
-    if not colors:
-        raise ValueError("match_material() requires at least one representative colour")
-
-    ranked: list[MaterialScore] = sorted(
-        (
-            MaterialScore(
-                material=entry.name,
-                similarity=round(_score_entry(entry, colors, settings), SIMILARITY_DECIMALS),
-            )
-            for entry in database.entries
-        ),
-        key=lambda score: (-score.similarity, score.material),
-    )
-
+    ranked = rank_materials(flame_colors, database, settings)
     best = ranked[0]
     entry = database.get(best.material)
     analysis = MaterialAnalysis(

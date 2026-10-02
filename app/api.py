@@ -1,31 +1,22 @@
 """FastAPI HTTP layer for the FlameAnalyzer backend.
 
-This module is intentionally thin.  It performs transport concerns only -
-request validation, size limits, decoding uploaded bytes, calling the existing
-:func:`app.imaging.decode_image_bytes` helper, invoking the existing
-``FlameAnalyzer``, optionally attaching the secondary Gemini material
-analysis, and mapping the existing error codes onto HTTP statuses::
+Transport concerns only - upload validation, size limits, decoding, the
+48-hour result cache and error mapping.  The analysis itself lives in
+:class:`app.analyzer.FlameAnalyzer` (detections, masks, colour evidence),
+:mod:`app.vision_providers` (Groq / Gemini vision evidence),
+:mod:`app.material_fusion` (the Python material decision) and
+:mod:`app.video_analysis` (server-side video analysis)::
 
-    HTTP request
-        -> upload validation / size limit
-        -> app.imaging.decode_image_bytes(...)
-        -> FlameAnalyzer.analyze_image(...)
-        -> existing schemas (already JSON-safe)
-        -> [secondary Gemini analysis: ai_material_analysis]
-        -> JSON response
+    POST /analyze        image -> SHA-256 cache -> <=3 detections -> <=3 masks
+                         -> merged mask -> RGB/LAB -> vision evidence
+                         -> Python fusion -> fire class -> cache
+    POST /analyze-video  video -> SHA-256 cache -> frames -> per-frame pipeline
+                         -> Python majority vote -> cache
+    POST /material-identification   one client-measured colour -> Python fusion
+    POST /video-material-analysis   client frame colours -> Python majority vote
+    POST /activity       EC2 inactivity watchdog heartbeat (frontend only)
 
-No detection, segmentation, clustering or material-matching logic lives here.
-
-The two video endpoints are transport layers over
-:mod:`app.video_material`:
-
-* ``POST /material-identification`` runs the *existing* deterministic matcher
-  against an aggregated flame colour the client measured itself.  No detection
-  and no segmentation are involved, and no Gemini call is made - this is the
-  source of truth for the video fire class.
-* ``POST /video-material-analysis`` sends every supplied frame's structured
-  evidence to Gemini in **one** request and returns **one** consolidated
-  video-level material assessment.
+No LLM ever produces a final material or a final video conclusion.
 
 Run locally with::
 
@@ -34,8 +25,11 @@ Run locally with::
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import os
+import tempfile
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
@@ -43,39 +37,47 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .analysis_cache import AnalysisCache, sha256_hex
 from .analyzer import FlameAnalyzer
 from .config import Settings
 from .flame_evidence import extract_flame_evidence
 from .errors import (
     AnalysisError,
     AnalyzerUnavailableError,
+    DetectionFailedError,
+    FrameExtractionError,
     ImageTooLargeError,
     InferenceError,
     InvalidImageError,
+    InvalidVideoError,
     MissingDatabaseError,
     MissingModelError,
     MissingUploadError,
     NoFireDetectedError,
     NoFlamePixelsError,
+    UnsupportedMediaError,
     ValidationError,
+    VideoTooLargeError,
     error_payload,
 )
 from .gemini_analysis import gemini_material_analysis
 from .imaging import decode_image_bytes
 from .material_matching import MaterialDatabase, load_material_database
+from .video_analysis import analyze_video_file
 from .video_material import (
     MaterialIdentificationRequest,
     VideoMaterialAnalysisRequest,
     identify_material,
     video_material_analysis,
 )
+from .vision_providers import collect_vision_evidence, unavailable_vision
 
 __all__ = ["app", "create_app", "SERVICE_NAME", "ERROR_STATUS"]
 
@@ -102,7 +104,18 @@ ERROR_STATUS: dict[str, int] = {
     MissingDatabaseError.code: 503,
     AnalyzerUnavailableError.code: 503,
     InferenceError.code: 500,
+    DetectionFailedError.code: 500,
+    InvalidVideoError.code: 400,
+    FrameExtractionError.code: 400,
+    VideoTooLargeError.code: 413,
+    UnsupportedMediaError.code: 415,
 }
+
+#: Container extensions accepted by ``POST /analyze-video``.
+_VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".3gp", ".wmv", ".flv")
+_VIDEO_PATH = "/analyze-video"
+#: Outcomes worth caching: completed analyses, including "no flame found".
+_CACHEABLE_ERRORS = (NoFireDetectedError.code, NoFlamePixelsError.code)
 
 
 # ---------------------------------------------------------------------------
@@ -124,24 +137,41 @@ def _result_response(result: dict[str, Any]) -> JSONResponse:
     return JSONResponse(status_code=ERROR_STATUS.get(code, 500), content=result)
 
 
-async def _attach_ai_material_analysis(request: Request, result: dict[str, Any]) -> dict[str, Any]:
-    """Add the secondary Gemini material analysis to a successful result.
+def _query_flag(request: Request, name: str) -> bool:
+    """Boolean query parameter (``1/true/yes/on``); the form field is preferred."""
+    value = request.query_params.get(name)
+    return bool(value) and value.strip().lower() in {"1", "true", "yes", "on"}
 
-    Strictly additive and strictly non-blocking: the deterministic
-    ``material_analysis`` is already complete when this runs, and *any* Gemini
-    failure (disabled, missing key, quota, timeout, malformed payload) becomes
-    ``ai_material_analysis: {"available": false, ...}`` rather than an error for
-    the whole request.  Only the flame evidence extracted from the analyzer's
-    own result is forwarded - never the image and never the mask payload.
+
+def _is_video_upload(upload: UploadFile) -> bool:
+    content_type = (upload.content_type or "").lower()
+    suffix = Path(upload.filename or "").suffix.lower()
+    if content_type.startswith("video/"):
+        return True
+    return suffix in _VIDEO_EXTENSIONS and content_type in ("", "application/octet-stream")
+
+
+def _cacheable(result: dict[str, Any]) -> bool:
+    if result.get("success") is True:
+        return True
+    return ((result.get("error") or {}).get("code")) in _CACHEABLE_ERRORS
+
+
+async def _ai_material_payload(request: Request, result: dict[str, Any]) -> dict[str, Any]:
+    """The existing numerical Gemini analysis, as separate secondary evidence.
+
+    It receives only numbers extracted from the deterministic result (never the
+    image), never influences the fused material, and any failure becomes
+    ``{"available": false, ...}``.
     """
     settings = request.app.state.settings
     evidence = extract_flame_evidence(result)
     if not evidence.get("mean_color"):
-        result["ai_material_analysis"] = {
+        return {
             "available": False,
+            "role": "secondary_evidence_only",
             "error": "No flame colour evidence was extracted for the AI analysis.",
         }
-        return result
 
     analyzer = getattr(request.app.state, "analyzer", None)
     database = None
@@ -153,35 +183,31 @@ async def _attach_ai_material_analysis(request: Request, result: dict[str, Any])
 
     started = time.perf_counter()
     try:
-        payload = await run_in_threadpool(
-            gemini_material_analysis, evidence, settings, database
-        )
+        payload = await run_in_threadpool(gemini_material_analysis, evidence, settings, database)
     except Exception:  # noqa: BLE001 - the AI analysis must never fail the request
         logger.exception("AI material analysis failed unexpectedly")
         payload = {"available": False, "error": "The AI material analysis could not be completed."}
-    result["ai_material_analysis"] = payload
-
+    payload["role"] = "secondary_evidence_only"
     if payload.get("available") is True:
-        timing = result.get("timing")
-        if isinstance(timing, dict):
-            timing["ai_material_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
-    return result
+        payload["duration_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+    return payload
 
 
 # ---------------------------------------------------------------------------
 # EC2 inactivity heartbeat
 # ---------------------------------------------------------------------------
 def _touch_activity_file(path: Path) -> None:
-    """Refresh the modification time of the EC2 inactivity watchdog file.
+    """Record a frontend activity heartbeat for the EC2 inactivity watchdog.
 
-    Best-effort by contract: the watchdog file lives on the instance and may
-    be unwritable (read-only mount, missing directory, permissions).  A
-    failure here is logged and swallowed so it can never break ``/analyze``
-    or any other endpoint.  A missing file is created.
+    Writes the current Unix time into the file and refreshes its modification
+    time, creating the parent directory when needed.  Only ``POST /activity``
+    calls this - analysis requests never reset the watchdog.  Best-effort: a
+    failure is logged and swallowed.
     """
     try:
-        path.touch(exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         now = time.time()
+        path.write_text(f"{int(now)}\n", encoding="utf-8")
         os.utime(path, (now, now))
     except OSError:
         logger.warning("Could not update the activity file %s", path)
@@ -221,10 +247,11 @@ class MaxUploadSizeMiddleware:
     chunked uploads that carry no ``Content-Length``.
     """
 
-    def __init__(self, app: Any, max_bytes: int) -> None:
+    def __init__(self, app: Any, max_bytes: int, max_video_bytes: int | None = None) -> None:
         self.app = app
         self.max_bytes = max_bytes
         self.limit = max_bytes + _ENVELOPE_ALLOWANCE
+        self.video_limit = (max_video_bytes or max_bytes) + _ENVELOPE_ALLOWANCE
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
         if scope.get("type") != "http" or scope.get("method") != "POST":
@@ -237,11 +264,13 @@ class MaxUploadSizeMiddleware:
                 content_length = value.decode("latin-1")
                 break
 
-        if content_length and content_length.isdigit() and int(content_length) > self.limit:
+        is_video = scope.get("path") == _VIDEO_PATH
+        limit = self.video_limit if is_video else self.limit
+        if content_length and content_length.isdigit() and int(content_length) > limit:
             logger.warning(
-                "Rejected request with Content-Length=%s (limit=%s)", content_length, self.limit
+                "Rejected request with Content-Length=%s (limit=%s)", content_length, limit
             )
-            response = _error_response(ImageTooLargeError())
+            response = _error_response(VideoTooLargeError() if is_video else ImageTooLargeError())
             await response(scope, receive, send)
             return
 
@@ -290,49 +319,24 @@ def create_app(
         version=__version__,
         summary="Fire detection, flame segmentation, fire-class and agent analysis.",
         description=(
-            "Headless inference API for the FlameAnalyzer pipeline: YOLO fire "
-            "detection, YOLO flame segmentation, flame colour clustering in "
-            "CIELAB (K-Means, GMM, Bayesian GMM, DBSCAN and Agglomerative "
-            "Clustering - MeanShift is not used), deterministic material matching "
-            "against `flame_dataset.json`, and a fire class plus extinguishing "
-            "agents derived from that material through a documented mapping.\n\n"
-            "The response carries the *actual segmented flame mask* as a base64 "
-            "PNG.  The detection bounding box (`fire_detection.bbox`) and the "
-            "segmentation mask (`segmentation.mask`) are separate fields: the box "
-            "is a detection rectangle, the mask is the flame region.\n\n"
-             "When `GEMINI_ENABLED=1` and `GEMINI_API_KEY` are set, a secondary "
-             "`ai_material_analysis` section adds an independent, "
-             "uncertainty-aware Gemini opinion on the burning material.  It "
-             "receives only the flame evidence extracted from the analyzer's own "
-             "result (final RGB/LAB, HSV, brightness, saturation, flame-region "
-             "statistics, detection/segmentation confidences, bounding-box "
-             "geometry and the already-calculated colour clusters) plus the "
-             "canonical material vocabulary - never the image - and any Gemini "
-             "failure degrades to `ai_material_analysis: {available: false}` "
-             "without affecting the deterministic result.  The AI analysis may "
-"report `primary_material: null` with `uncertain: true` when the "
-            "evidence cannot reliably distinguish materials.\n\n"
-            "Video analysis is a separate flow that reuses the same deterministic "
-            "pipeline and the same Gemini configuration:\n\n"
-            "* `POST /material-identification` is **deterministic**. It takes the "
-            "aggregated flame colour (`rgb`, `lab`) that a client measured across "
-            "the video frames it analysed, runs the existing LAB matcher against "
-            "the existing `flame_dataset.json` - no detection, no segmentation, no "
-            "LLM - and returns the same material analysis, fire class and "
-            "extinguishing agents as the image workflow. This is the source of "
-            "truth for the video fire class.\n"
-            "* `POST /video-material-analysis` takes the structured per-frame "
-            "evidence of a whole video (numbers only; images and base64 are "
-            "rejected) and performs **one** Gemini request over the entire "
-            "collection, returning **one** consolidated video-level material "
-            "assessment in the same structure as the image AI analysis. Gemini is "
-            "never called per frame, per-frame confidences are never averaged, and "
-            "no single frame's answer is picked out.\n\n"
-            "`GEMINI_API_KEY` and any AWS credentials are read from the server "
-            "environment only: they are never logged, never returned by any "
-            "endpoint and never reachable by the frontend.\n\n"
-            "No UI, no tunnels. Models are loaded once per worker process and "
-            "reused for every request."
+            "Headless inference API for the FlameAnalyzer pipeline.\n\n"
+            "`POST /analyze`: up to 3 YOLO fire detections, one segmentation mask per "
+            "detection, the masks merged into one flame mask (boxes are never merged), "
+            "CIELAB/RGB colour evidence from the merged mask, vision evidence from Groq "
+            "(Gemini vision as fallback) and a **Python** fusion engine that makes the "
+            "final material decision (`final_material`, `confidence`, `uncertain`). "
+            "The fire class and extinguishing agents come from the deterministic "
+            "mapping in `app/fire_classes.py`. Vision models are evidence only.\n\n"
+            "`POST /analyze-video`: the same per-frame pipeline over evenly spaced "
+            "frames and a Python majority/consistency vote; returns up to 3 "
+            "representative frames plus every analysed frame. No LLM produces the "
+            "video conclusion.\n\n"
+            "Results are cached for 48 hours by the SHA-256 of the uploaded file "
+            "(`cached: true`); send `force_new_analysis=true` to re-run and replace "
+            "the entry.\n\n"
+            "The secondary numerical Gemini analysis (`ai_material_analysis`) remains "
+            "separate evidence and never decides the material. API keys are read "
+            "from the server environment only and are never returned or logged."
         ),
         lifespan=lifespan,
     )
@@ -343,8 +347,12 @@ def create_app(
     application.state.settings = settings
     application.state.inference_lock = threading.Lock()
 
+    application.state.cache = AnalysisCache(settings.cache_dir, enabled=settings.cache_enabled)
+
     application.add_middleware(
-        MaxUploadSizeMiddleware, max_bytes=settings.max_image_mb * BYTES_PER_MB
+        MaxUploadSizeMiddleware,
+        max_bytes=settings.max_image_mb * BYTES_PER_MB,
+        max_video_bytes=settings.max_video_mb * BYTES_PER_MB,
     )
 
     if settings.cors_origins:
@@ -429,10 +437,12 @@ def create_app(
     async def activity_post(request: Request) -> dict[str, str]:
         """Heartbeat for the EC2 inactivity watchdog.
 
-        Touches ``settings.activity_file`` (default
-        ``/var/run/flame-analyzer-last-activity``) so the watchdog sees the
-        instance as active.  No authentication, no body, no expensive
-        processing.  The update is best-effort: even if the file cannot be
+        Updates ``settings.activity_file`` (default
+        ``/var/lib/flame-analyzer/last-activity``), the only timestamp the
+        watchdog uses.  The frontend calls this while the user is actively using
+        the application; analysis requests never update it, so the shutdown
+        countdown runs from the last frontend activity.  No authentication, no
+        body, no expensive processing.  The update is best-effort: even if the file cannot be
         written the endpoint still returns 200 so a transient filesystem
         problem never turns into a frontend-visible error.
         """
@@ -492,32 +502,41 @@ def create_app(
             },
         },
     )
-    async def analyze(request: Request, image: UploadFile = File(description="Image file to analyse")) -> JSONResponse:
-        """Run the existing FlameAnalyzer pipeline on an uploaded image.
+    async def analyze(
+        request: Request,
+        image: UploadFile = File(description="Image file to analyse"),
+        force_new_analysis: bool = Form(
+            False,
+            description="Ignore any cached result, re-run the full analysis and replace the cache entry.",
+        ),
+    ) -> JSONResponse:
+        """Run the full image pipeline on an uploaded image.
 
-        Accepts `multipart/form-data` with a single `image` field. The bytes are
-        decoded in memory (no temporary files) and the response is exactly the
-        structure produced by ``FlameAnalyzer.analyze_image``: no NumPy arrays,
-        no model objects, no filesystem paths.
+        Accepts `multipart/form-data` with an `image` field and an optional
+        `force_new_analysis` boolean (also accepted as a query parameter).
 
-        The response reports the detection bounding box
-        (`fire_detection.bounding_box`, alias `bbox`) and the segmented flame
-        region (`segmentation.mask`, a base64 PNG) independently, so a client
-        can overlay the real flame mask without re-deriving it from the box.
+        Pipeline: SHA-256 of the uploaded bytes -> 48-hour cache lookup (skipped
+        when `force_new_analysis=true`) -> up to 3 YOLO detections -> one mask per
+        detection -> merged mask -> RGB/LAB evidence -> vision evidence (Groq,
+        Gemini fallback) -> Python fusion -> deterministic fire class -> cache.
+
+        `cached` reports whether the result came from the cache.  The detection
+        boxes (`detections[]`) are never merged; `segmentation.mask` is the merged
+        flame mask used for every measurement.
         """
         started = time.perf_counter()
+        force = force_new_analysis or _query_flag(request, "force_new_analysis")
 
         limit = max(1, int(settings.max_image_mb)) * BYTES_PER_MB
         logger.info(
-            "Analyze request received (content_type=%s, filename=%s)",
+            "Analyze request received (content_type=%s, force_new_analysis=%s)",
             image.content_type,
-            image.filename,
+            force,
         )
-
-        try:
-            analyzer = _require_analyzer(request)
-        except AnalysisError as error:
-            return _error_response(error)
+        if _is_video_upload(image):
+            return _error_response(
+                UnsupportedMediaError("Videos are not accepted here; use POST /analyze-video.")
+            )
 
         try:
             content = await _read_limited(image, limit)
@@ -533,6 +552,20 @@ def create_app(
         if not content:
             return _error_response(MissingUploadError())
 
+        cache: AnalysisCache = request.app.state.cache
+        digest = sha256_hex(content)
+        if not force:
+            cached = await run_in_threadpool(cache.get, "image", digest)
+            if cached is not None:
+                cached["cached"] = True
+                logger.info("Analysis served from cache")
+                return _result_response(cached)
+
+        try:
+            analyzer = _require_analyzer(request)
+        except AnalysisError as error:
+            return _error_response(error)
+
         try:
             # Decoding is CPU-bound, so it is pushed to a worker thread.
             image_bgr = await run_in_threadpool(decode_image_bytes, content)
@@ -545,18 +578,8 @@ def create_app(
         height, width = image_bgr.shape[:2]
         logger.info("Decoded upload %sx%s for analysis", width, height)
 
-        def analyze_locked() -> dict:
-            """Run one inference, serialised per worker process.
-
-            The lock is acquired and released on a worker thread, never on the
-            event loop: a blocking acquire on the loop would stop the holder
-            from ever being resumed to release it, deadlocking the server.
-            """
-            with request.app.state.inference_lock:
-                return analyzer.analyze_image(image_bgr)
-
         try:
-            result = await run_in_threadpool(analyze_locked)
+            result = await _run_image_pipeline(request, analyzer, image_bgr)
         except AnalysisError as error:
             return _error_response(error)
         except Exception:  # noqa: BLE001
@@ -567,10 +590,10 @@ def create_app(
             logger.error("FlameAnalyzer returned a non-dict result")
             return _error_response(InferenceError())
 
-        if result.get("success") is True:
-            # Secondary, independent Gemini opinion.  Runs after the
-            # deterministic result is final and can never alter it.
-            result = await _attach_ai_material_analysis(request, result)
+        result["analysis_type"] = "image"
+        result["cached"] = False
+        if _cacheable(result):
+            await run_in_threadpool(cache.set, "image", digest, result)
 
         response = _result_response(result)
         logger.info(
@@ -580,6 +603,175 @@ def create_app(
             (time.perf_counter() - started) * 1000.0,
         )
         return response
+
+    async def _run_image_pipeline(request: Request, analyzer: Any, image_bgr: Any) -> dict[str, Any]:
+        """process_frame (locked) -> vision + numerical Gemini (concurrent) -> fusion."""
+
+        def process_locked():
+            """Run one inference, serialised per worker process.
+
+            The lock is acquired and released on a worker thread, never on the
+            event loop: a blocking acquire on the loop would stop the holder
+            from ever being resumed to release it, deadlocking the server.
+            """
+            with request.app.state.inference_lock:
+                if not hasattr(analyzer, "process_frame"):
+                    return analyzer.analyze_image(image_bgr)
+                return analyzer.process_frame(image_bgr)
+
+        frame = await run_in_threadpool(process_locked)
+        if isinstance(frame, dict):  # analyzer without the frame API
+            if frame.get("success") is True:
+                frame["ai_material_analysis"] = await _ai_material_payload(request, frame)
+            return frame
+        if not frame.success:
+            return frame.result
+
+        async def vision_task() -> tuple[dict[str, Any], float]:
+            stage = time.perf_counter()
+            try:
+                block = await run_in_threadpool(
+                    collect_vision_evidence, frame.image, frame.mask, settings, analyzer.database
+                )
+            except Exception:  # noqa: BLE001 - vision never breaks the analysis
+                logger.exception("Vision evidence failed unexpectedly")
+                block = unavailable_vision("vision evidence failed unexpectedly")
+            return block, round((time.perf_counter() - stage) * 1000.0, 2)
+
+        (vision, vision_ms), ai_payload = await asyncio.gather(
+            vision_task(), _ai_material_payload(request, frame.result)
+        )
+        frame.image, frame.mask = None, None
+        result = await run_in_threadpool(
+            analyzer.finalize, frame, vision, {"vision_ms": vision_ms}
+        )
+        result["ai_material_analysis"] = ai_payload
+        return result
+
+    @application.post(
+        "/analyze-video",
+        tags=["analysis"],
+        summary="Analyse a video: per-frame detection, masks, evidence and Python voting",
+        responses={
+            200: {
+                "description": (
+                    "Video analysed. `success: false` with `NO_FIRE_DETECTED` means the "
+                    "video was valid but no sampled frame contained a usable flame."
+                )
+            },
+            400: {"description": "The upload is not a decodable video (`INVALID_VIDEO`, `FRAME_EXTRACTION_FAILED`)."},
+            413: {"description": "The upload exceeded `FLAME_MAX_VIDEO_MB` (`VIDEO_TOO_LARGE`)."},
+            415: {"description": "The upload is not a video (`UNSUPPORTED_MEDIA`)."},
+            422: {"description": "The `video` field is missing (`VALIDATION_ERROR`)."},
+            503: {"description": "Models are not loaded."},
+        },
+    )
+    async def analyze_video(
+        request: Request,
+        video: UploadFile = File(description="Video file to analyse"),
+        force_new_analysis: bool = Form(
+            False,
+            description="Ignore any cached result, re-run the full analysis and replace the cache entry.",
+        ),
+    ) -> JSONResponse:
+        """Full server-side video analysis.
+
+        The cache key is the SHA-256 of the **original video file**.  Evenly
+        spaced frames (`FLAME_VIDEO_MAX_FRAMES`) each go through the image
+        pipeline (<=3 detections, <=3 masks, merged mask, RGB/LAB evidence,
+        vision evidence for up to `FLAME_VIDEO_VISION_FRAMES` frames, Python
+        fusion).  The video material and fire class come from a Python
+        majority/consistency vote over the frame decisions - never from an LLM.
+        Returns `representative_frames` (up to 3) and every frame in `frames`.
+        """
+        started = time.perf_counter()
+        force = force_new_analysis or _query_flag(request, "force_new_analysis")
+        if not _is_video_upload(video):
+            return _error_response(UnsupportedMediaError("The uploaded file is not a supported video."))
+
+        try:
+            analyzer = _require_analyzer(request)
+        except AnalysisError as error:
+            return _error_response(error)
+
+        limit = max(1, int(settings.max_video_mb)) * BYTES_PER_MB
+        suffix = Path(video.filename or "").suffix.lower()
+        suffix = suffix if suffix in _VIDEO_EXTENSIONS else ".mp4"
+        tmp_path: str | None = None
+        try:
+            try:
+                tmp_path, digest, size = await _spool_upload(video, limit, suffix)
+            except VideoTooLargeError:
+                return _error_response(
+                    VideoTooLargeError(
+                        f"The uploaded video exceeds the maximum allowed size ({settings.max_video_mb} MB)."
+                    )
+                )
+            if size == 0:
+                return _error_response(MissingUploadError("No video file was provided in the 'video' field."))
+
+            cache: AnalysisCache = request.app.state.cache
+            if not force:
+                cached = await run_in_threadpool(cache.get, "video", digest)
+                if cached is not None:
+                    cached["cached"] = True
+                    logger.info("Video analysis served from cache")
+                    return _result_response(cached)
+
+            try:
+                result = await run_in_threadpool(
+                    analyze_video_file,
+                    tmp_path,
+                    analyzer,
+                    settings,
+                    request.app.state.inference_lock,
+                )
+            except AnalysisError as error:
+                return _error_response(error)
+            except Exception:  # noqa: BLE001
+                logger.exception("Unexpected video analysis failure")
+                return _error_response(InferenceError())
+
+            result["cached"] = False
+            if _cacheable(result):
+                await run_in_threadpool(cache.set, "video", digest, result)
+            logger.info(
+                "Video analysis complete (success=%s, frames=%s, total_ms=%.2f)",
+                result.get("success"),
+                (result.get("video") or {}).get("frames_sampled"),
+                (time.perf_counter() - started) * 1000.0,
+            )
+            return _result_response(result)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    logger.warning("Could not delete a temporary video file")
+
+    async def _spool_upload(upload: UploadFile, limit: int, suffix: str) -> tuple[str, str, int]:
+        """Stream an upload to a temp file while hashing it; never buffers it all."""
+        hasher = hashlib.sha256()
+        total = 0
+        fd, path = tempfile.mkstemp(prefix="flame-video-", suffix=suffix)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                while True:
+                    chunk = await upload.read(_READ_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise VideoTooLargeError()
+                    hasher.update(chunk)
+                    handle.write(chunk)
+        except BaseException:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        return path, hasher.hexdigest(), total
 
     @application.post(
         "/material-identification",
@@ -620,14 +812,11 @@ def create_app(
         RGB channels are 0-255; LAB is in the `scikit-image` convention the
         dataset uses (L 0-100, a/b -128..127).
 
-        The colour is handed to the **same**
-        :func:`app.material_matching.match_material` that ``/analyze`` uses,
-        against the **same** canonical `flame_dataset.json`.  There is no second
-        classifier, no duplicated material list and no Gemini call here, and no
-        YOLO detection or segmentation is run - the client already has the
-        evidence.  The fire class and the extinguishing agents come from the
-        existing `app/fire_classes.py` mapping applied to this deterministic
-        match, which is what makes the video fire class trustworthy.
+        The colour is ranked by the same LAB matcher ``/analyze`` uses and decided
+        by the same Python fusion engine (colour evidence only - there is no image
+        for vision evidence here), so the result is `uncertain` whenever colour
+        cannot separate the leading materials.  The fire class and agents come
+        from `app/fire_classes.py`.
         """
         started = time.perf_counter()
         try:
@@ -650,20 +839,8 @@ def create_app(
     @application.post(
         "/video-material-analysis",
         tags=["analysis"],
-        summary="One consolidated AI material assessment for a whole video",
+        summary="Deterministic video material vote over client-measured frame colours",
         responses={
-            200: {
-                "description": (
-                    "Exactly one consolidated video-level material assessment, in the "
-                    "same structure the image AI analysis returns. `available: false` "
-                    "means Gemini could not produce a usable result; the frame counts "
-                    "and `display_threshold_percent` are still reported, and Gemini's "
-                    "confidence is never adjusted to reach it."
-                ),
-                "content": {
-                    "application/json": {"example": _VIDEO_MATERIAL_ANALYSIS_EXAMPLE}
-                },
-            },
             422: {
                 "description": (
                     "The body was malformed: `frames` must be a non-empty list of "
@@ -673,56 +850,36 @@ def create_app(
                 ),
                 "content": {"application/json": {"example": _VALIDATION_EXAMPLE}},
             },
+            503: {"description": "`flame_dataset.json` could not be loaded."},
         },
     )
     async def video_material_analysis_endpoint(
         request: Request, payload: VideoMaterialAnalysisRequest
     ) -> JSONResponse:
-        """Assess a whole video with ONE Gemini request over all frame evidence.
+        """Decide every supplied frame with the Python fusion engine, then vote.
 
-        Body: `{"frames": [{"frame_index", "timestamp_seconds", "rgb", "lab",
-        "detection_confidence", "flame_area_ratio", "segmentation_confidence"},
-        ...]}`.  Only measurements are accepted - never an image, a mask or base64.
-
-        Every frame's evidence goes into a **single** Gemini request and exactly
-        **one** consolidated, video-level material assessment comes back.  Gemini
-        is never called per frame, per-frame confidences are never averaged and
-        neither the first nor the highest-confidence frame's answer is selected;
-        the model is instructed to judge the collection jointly and to let the
-        consistency, quality and amount of evidence across all frames drive its
-        confidence.
-
-        The response is the canonical AI structure - `available`,
-        `primary_material`, `matches`, `overall_confidence_level`, `uncertain`,
-        `evidence_quality`, `reasoning_summary` - plus `frames_supplied`,
-        `frames_analyzed` and `display_threshold_percent` (the frontend's AI-card
-        visibility rule, 45).  A result below the threshold is still returned
-        unchanged.  This endpoint is Gemini-only: the video fire class comes from
-        the deterministic `/material-identification` response.
+        No LLM is called: the former single-Gemini consolidated answer was
+        removed.  Legacy fields (`available`, `primary_material`, `matches`,
+        `overall_confidence_level`, `frames_supplied`, `frames_analyzed`,
+        `display_threshold_percent`) are still returned, now derived from the
+        deterministic vote.  For full server-side analysis use `/analyze-video`.
         """
         started = time.perf_counter()
         try:
             database = _material_database(request)
-        except AnalysisError:
-            # Not fatal here: the AI analysis reports the missing database itself
-            # as an unavailable result, exactly as the image workflow does.
-            database = None
-
-        try:
             body = await run_in_threadpool(
                 video_material_analysis, payload.frames, settings, database
             )
+        except AnalysisError as error:
+            return _error_response(error)
         except Exception:  # noqa: BLE001 - never leak an internal traceback
             logger.exception("Video material analysis failed unexpectedly")
-            body = {
-                "available": False,
-                "error": "The video AI material analysis could not be completed.",
-            }
+            return _error_response(InferenceError())
 
         logger.info(
-            "Video material analysis complete (frames=%s, available=%s, total_ms=%.2f)",
+            "Video material vote complete (frames=%s, material=%s, total_ms=%.2f)",
             body.get("frames_analyzed"),
-            body.get("available"),
+            body.get("final_material"),
             (time.perf_counter() - started) * 1000.0,
         )
         return JSONResponse(status_code=200, content=body)
@@ -987,39 +1144,6 @@ _MATERIAL_IDENTIFICATION_EXAMPLE: dict[str, Any] = {
             "compound_basis": "name verbatim from flame_dataset.json; ...",
         },
     ],
-}
-
-#: `POST /video-material-analysis` - ONE consolidated result for the whole video,
-#: never one result per frame.  The `matches` list is the single ranked answer for
-#: the video, exactly as for a single image.
-_VIDEO_MATERIAL_ANALYSIS_EXAMPLE: dict[str, Any] = {
-    "available": True,
-    "primary_material": "Natural Fibers",
-    "matches": [
-        {
-            "rank": 1,
-            "material": "Natural Fibers",
-            "confidence_percent": 72.0,
-            "reason": "Consistent yellow-orange colour across all frames supports an organic fuel.",
-        },
-        {
-            "rank": 2,
-            "material": "Paper Products(Wood material)",
-            "confidence_percent": 64.0,
-            "reason": "Also plausible; the frames do not separate paper from fibre.",
-        },
-    ],
-    "overall_confidence_level": "medium",
-    "uncertain": False,
-    "evidence_quality": "moderate",
-    "reasoning_summary": (
-        "All sampled frames of this video show the same yellow-orange flame with a "
-        "blue base, which supports one organic, carbon-based material for the event "
-        "as a whole rather than a per-frame verdict."
-    ),
-    "frames_supplied": 4,
-    "frames_analyzed": 4,
-    "display_threshold_percent": 45.0,
 }
 
 #: Module level application used by ``uvicorn app.api:app``.

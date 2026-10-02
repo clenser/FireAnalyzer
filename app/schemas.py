@@ -112,6 +112,15 @@ class SegmentationSummary:
     #: True when ``mask`` was produced by rasterising the detection box because
     #: the segmentation model was unavailable or returned nothing usable.
     bbox_fallback_reason: str | None = None
+    #: Number of per-detection masks that contributed to ``mask``.
+    mask_count: int = 0
+    #: True when ``mask`` is the union of the per-detection masks (always the
+    #: case for the multi-detection pipeline, even with a single detection).
+    merged: bool = False
+    #: One entry per detection, in detection order: where its mask came from
+    #: (``segmentation`` / ``bbox_fallback`` / ``none``), the segmentation
+    #: confidence and the pixel count of that individual mask.
+    detection_masks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

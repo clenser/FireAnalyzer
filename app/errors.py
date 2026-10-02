@@ -23,6 +23,11 @@ __all__ = [
     "AnalyzerUnavailableError",
     "ValidationError",
     "InferenceError",
+    "DetectionFailedError",
+    "InvalidVideoError",
+    "VideoTooLargeError",
+    "UnsupportedMediaError",
+    "FrameExtractionError",
     "error_payload",
     "ERROR_CODES",
 ]
@@ -117,6 +122,41 @@ class InferenceError(AnalysisError):
     message = "An unexpected error occurred during inference."
 
 
+class DetectionFailedError(AnalysisError):
+    """The detection model raised while processing a valid image."""
+
+    code = "DETECTION_FAILED"
+    message = "Fire detection failed for the supplied image."
+
+
+class InvalidVideoError(AnalysisError):
+    """The upload is empty, corrupt or not a decodable video."""
+
+    code = "INVALID_VIDEO"
+    message = "The uploaded data could not be decoded as a valid video."
+
+
+class VideoTooLargeError(AnalysisError):
+    """The video upload exceeded the configured maximum size."""
+
+    code = "VIDEO_TOO_LARGE"
+    message = "The uploaded video exceeds the maximum allowed size."
+
+
+class UnsupportedMediaError(AnalysisError):
+    """The upload's media type is not supported by this endpoint."""
+
+    code = "UNSUPPORTED_MEDIA"
+    message = "The uploaded file type is not supported by this endpoint."
+
+
+class FrameExtractionError(AnalysisError):
+    """The video opened but no frame could be extracted from it."""
+
+    code = "FRAME_EXTRACTION_FAILED"
+    message = "No frames could be extracted from the uploaded video."
+
+
 #: Every error code this backend is able to emit, for API documentation.
 ERROR_CODES: tuple[str, ...] = (
     MissingUploadError.code,
@@ -129,6 +169,11 @@ ERROR_CODES: tuple[str, ...] = (
     AnalyzerUnavailableError.code,
     ValidationError.code,
     InferenceError.code,
+    DetectionFailedError.code,
+    InvalidVideoError.code,
+    VideoTooLargeError.code,
+    UnsupportedMediaError.code,
+    FrameExtractionError.code,
 )
 
 
