@@ -30,8 +30,8 @@ __all__ = ["CACHE_TTL_SECONDS", "AnalysisCache", "sha256_hex"]
 
 logger = logging.getLogger(__name__)
 
-#: Exactly 48 hours.
-CACHE_TTL_SECONDS = 48 * 60 * 60
+#: Exactly 30 minutes.
+CACHE_TTL_SECONDS = 30 * 60
 
 #: Bumped whenever the cached result structure changes, so results produced by
 #: an older pipeline are never served after a deploy.
